@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monti - Difficulty-Based Model Router for Coding Agents</title>
+    <meta name="description" content="Monti routes coding-agent requests to the right model based on task difficulty, using only the subscriptions you already pay for. No API keys.">
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Monti</h1>
+            <p class="tagline">Difficulty-based model router for coding agents, powered only by the subscriptions you already pay for</p>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <a href="#features">Features</a>
+            <a href="#providers">Providers</a>
+            <a href="#quickstart">Quickstart</a>
+            <a href="#opencode">opencode</a>
+            <a href="#modes">Modes</a>
+            <a href="#security">Security</a>
+            <a href="https://github.com/mmorri/monti" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        <section id="intro">
+            <p class="lead">
+                Every request is classified (trivial / easy / medium / hard) and routed to one of
+                four tiers: everyday, moderate, high, very_high. Each tier is an ordered pool of
+                interchangeable candidates across your Kimi, Anthropic, Meta Muse, Windsurf, OpenAI,
+                Copilot, xAI, Cursor, and Z.ai subscriptions. Same model on two subscriptions? List
+                it twice: the router burns the wallet you prefer and rotates when one cools down.
+                OAuth login only. <strong>No API keys anywhere</strong>: not stored, not accepted,
+                not even as a fallback. Fail closed, always.
+            </p>
+            <p>
+                Monti is a standalone local service, not a plugin or a fork. It works with
+                <a href="https://opencode.ai">opencode</a> (first-class, via a 10-line config) and
+                any OpenAI-compatible client, and it ships its own minimal terminal agent for
+                quick tasks.
+            </p>
+        </section>
+
+        <section id="features">
+            <h2>Features</h2>
+            <div class="feature-grid">
+                <div class="feature">
+                    <h3>Free Classification</h3>
+                    <p>Difficulty classification runs on a free-first pool, so routing itself
+                       costs about nothing. Only short task excerpts are sent to the
+                       classifier.</p>
+                </div>
+                <div class="feature">
+                    <h3>Wallet Rotation</h3>
+                    <p>Each tier lists candidates in your preference order. A 429 or quota
+                       refusal cools that wallet down and the next wallet serves. Same
+                       quality band, different subscription.</p>
+                </div>
+                <div class="feature">
+                    <h3>Session Escalation</h3>
+                    <p>In <code>weak-first-escalate</code> mode, sessions start at the routed
+                       tier and climb one rung after repeated tool errors or an explicit
+                       "this isn't working".</p>
+                </div>
+                <div class="feature">
+                    <h3>Live Model Catalogs</h3>
+                    <p><code>monti models</code> lists the live catalog of every logged-in
+                       subscription, so pinning a model never means guessing IDs.</p>
+                </div>
+                <div class="feature">
+                    <h3>Token Safety</h3>
+                    <p>Subscription tokens live in mode 0600 files with atomic writes,
+                       per-provider refresh locks, and one-retry-on-401, then a clear
+                       <code>RELOGIN_REQUIRED</code>. Tokens are never logged.</p>
+                </div>
+                <div class="feature">
+                    <h3>Config Guardrails</h3>
+                    <p>Config containing anything key-shaped is rejected at load time, and
+                       a source-scan test fails the build on key-shaped strings or env
+                       reads.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="providers">
+            <h2>Provider support</h2>
+            <div class="options-table">
+                <table>
+                    <tr><th>Provider</th><th>Login</th><th>Chat</th></tr>
+                    <tr><td><code>kimi</code> (kimi.ai)</td><td>Device flow</td><td>Yes</td></tr>
+                    <tr><td><code>anthropic</code> (Claude Pro/Max)</td><td>PKCE browser</td><td>Yes</td></tr>
+                    <tr><td><code>muse</code> (Meta Muse Code)</td><td>Device flow + key mint</td><td>Yes</td></tr>
+                    <tr><td><code>windsurf</code> (Cognition)</td><td>Browser OAuth</td><td>Yes (Connect-RPC)</td></tr>
+                    <tr><td><code>openai</code> (ChatGPT/Codex)</td><td>PKCE browser</td><td>Yes (Responses API)</td></tr>
+                    <tr><td><code>zai</code> (GLM Coding Plan)</td><td>Plan key, interactive login only</td><td>Yes</td></tr>
+                    <tr><td><code>copilot</code> (GitHub Copilot)</td><td>Device flow</td><td>Yes</td></tr>
+                    <tr><td><code>xai</code> (Grok)</td><td>PKCE browser</td><td>Yes</td></tr>
+                    <tr><td><code>cursor</code></td><td>PKCE browser</td><td>Not ported, fails closed</td></tr>
+                </table>
+            </div>
+            <p>Narrow, documented exception: plans with no portable OAuth flow (currently Z.ai)
+               accept the plan key interactively via <code>monti login zai</code> only, never
+               from config or environment. See SPEC.md.</p>
+        </section>
+
+        <section id="quickstart">
+            <h2>Quickstart</h2>
+            <p>Requires <strong>Python 3.11+</strong> on <strong>macOS or Linux</strong>.</p>
+
+            <h3>As a CLI tool (recommended)</h3>
+            <div class="code-block">
+                <pre><code>uv tool install git+https://github.com/mmorri/monti   # or: pipx install git+https://github.com/mmorri/monti
+monti setup           # connect subscriptions, auto-picks models, saves config
+monti models          # live catalogs + pool status
+monti                 # interactive session (/help for commands)</code></pre>
+            </div>
+            <p><code>monti setup</code> walks you through each provider login (skip what you
+               don't have), probes the live catalog of everything connected, and builds the
+               tier pools plus the free-first classifier from what actually exists on your
+               accounts.</p>
+
+            <h3>From a checkout (for development)</h3>
+            <div class="code-block">
+                <pre><code>git clone https://github.com/mmorri/monti &amp;&amp; cd monti
+uv venv &amp;&amp; uv pip install -e .      # or: python3 -m venv .venv &amp;&amp; .venv/bin/pip install -e .
+source .venv/bin/activate           # without this, `monti` is not on PATH
+monti login kimi</code></pre>
+            </div>
+        </section>
+
+        <section id="opencode">
+            <h2>Use with opencode</h2>
+            <div class="code-block">
+                <pre><code>monti serve          # or: model-router serve --config &lt;path&gt;</code></pre>
+            </div>
+            <div class="code-block">
+                <pre><code>{
+  "provider": {
+    "model-router": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" },
+      "models": {
+        "router-auto":      { "name": "Router · auto" },
+        "router-everyday":  { "name": "Router · everyday" },
+        "router-moderate":  { "name": "Router · moderate" },
+        "router-high":      { "name": "Router · high" },
+        "router-very-high": { "name": "Router · very high" }
+      }
+    }
+  }
+}</code></pre>
+            </div>
+            <p>Pick a router model in opencode's model picker, or send an
+               <code>X-Router-Mode</code> header from any client.</p>
+        </section>
+
+        <section id="modes">
+            <h2>Modes</h2>
+            <div class="options-table">
+                <table>
+                    <tr><th>Mode</th><th>Behavior</th></tr>
+                    <tr><td><code>auto</code> (default)</td>
+                        <td>Classify each request: trivial goes to everyday, easy to moderate,
+                            medium to high, hard to very_high.</td></tr>
+                    <tr><td><code>everyday-only</code> / <code>moderate-only</code> / <code>high-only</code> / <code>very-high-only</code></td>
+                        <td>Pin the tier.</td></tr>
+                    <tr><td><code>weak-first-escalate</code></td>
+                        <td>Start at the routed tier; climb one rung after N consecutive tool
+                            errors or an explicit signal. Sessions tracked via the
+                            <code>X-Router-Session</code> header.</td></tr>
+                </table>
+            </div>
+        </section>
+
+        <section id="security">
+            <h2>Security model</h2>
+            <ul class="requirements">
+                <li>Subscription OAuth tokens are the only credentials, stored mode 0600 and
+                    never logged; errors are status-only.</li>
+                <li>Config containing anything key-shaped is rejected at load time.</li>
+                <li>The terminal agent's file tools are workspace-confined; writes, edits, and
+                    shell commands require interactive approval (or explicit
+                    <code>--yes</code>).</li>
+            </ul>
+        </section>
+
+        <section id="docs">
+            <h2>Documentation</h2>
+            <ul>
+                <li><a href="https://github.com/mmorri/monti/blob/main/SPEC.md">SPEC.md</a>,
+                    design spec, including the plan-key exception.</li>
+                <li><a href="https://github.com/mmorri/monti/blob/main/docs/TRANSPORTS.md">docs/TRANSPORTS.md</a>,
+                    per-provider transport status and the Cursor decision record.</li>
+                <li><a href="https://github.com/mmorri/monti/blob/main/THIRD_PARTY.md">THIRD_PARTY.md</a>,
+                    attributions for the MIT-licensed OAuth flows this project ports.</li>
+            </ul>
+            <p class="warning"><strong>Disclaimer.</strong> Monti authenticates with your
+               personal subscriptions the same way the providers' own CLI clients do. Some
+               providers' terms of service may not contemplate third-party clients using
+               subscription tokens; you are responsible for how you use your own accounts.
+               This project is not affiliated with or endorsed by any provider.</p>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 Monti Project | <a href="https://github.com/mmorri/monti">GitHub</a> | <a href="https://github.com/mmorri/monti/blob/main/LICENSE">License</a></p>
+        </div>
+    </footer>
+</body>
+</html>
