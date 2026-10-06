@@ -11,6 +11,7 @@ tiers:
   moderate:
     - { provider: kimi,     model: "kimi-for-coding" }
     - { provider: windsurf, model: "gpt-5.5" }
+    - { provider: anthropic, model: "claude-haiku-4-5" }
     # NOTE: gpt-5.5 retires from OpenAI-side Codex on 2026-10-14; if Windsurf
     # follows, replace with whatever `monti models` lists (e.g. gpt-6-sol).
   high:

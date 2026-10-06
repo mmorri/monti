@@ -35,7 +35,7 @@ platform.claude.com/docs (all pinned snapshots, none sooner than Sep 2027):
 | `claude-fable-5-1` | very_high: long-horizon reasoning | TB4 57.9 (as Fable 5.1) |
 | `claude-opus-5-5` | very_high: daily-driver frontier | CAI 66 (#1), TB4 53.9 (as Opus 5) |
 | `claude-sonnet-5-5` | high: speed+intelligence balance | — |
-| `claude-haiku-4-5` | moderate: fastest, near-frontier | 73.3 Verified |
+| `claude-haiku-4-5` | moderate: fastest, near-frontier | 73.3 Verified, live 200 on this account 2026-10-06 |
 
 Legacy IDs (`opus-4.x`, `sonnet-4.x`, `sonnet-5` without `-5`) still resolve
 but are superseded — `claude-sonnet-4-5` (our old default) is stale.
