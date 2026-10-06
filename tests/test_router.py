@@ -340,10 +340,10 @@ class StubTransport(ChatTransport):
 
 
 def _app(tmp_path: Path, text="hello") -> ProxyApp:
-    store = TokenStore(tmp_path / "store")
-    store.save("kimi", Credentials(access="a", refresh="r", expires=0))
-    store.save("anthropic", Credentials(access="a", refresh="r", expires=0))
     cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
+    store = TokenStore(tmp_path / "store")
+    for tier in (cfg.fast, cfg.strong):  # stub whichever providers config names
+        store.save(tier.provider, Credentials(access="a", refresh="r", expires=0))
 
     class StubProvider:
         def __init__(self, provider):
@@ -360,8 +360,8 @@ def _app(tmp_path: Path, text="hello") -> ProxyApp:
 
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
     app.classifier.model_fn = None  # deterministic heuristic in tests
-    for provider_id in ("kimi", "anthropic"):
-        app.gateway._providers[provider_id] = StubProvider(create(provider_id))
+    for tier in (cfg.fast, cfg.strong):
+        app.gateway._providers[tier.provider] = StubProvider(tier.provider)
     return app
 
 
@@ -441,7 +441,7 @@ class _FlakyTransport(ChatTransport):
 
 def _flaky_fast(tmp_path: Path, text_before="", status=503) -> ProxyApp:
     app = _app(tmp_path)
-    fast = app.gateway._providers["kimi"]
+    fast = app.gateway._providers[app.config.fast.provider]
     fast.open_chat = lambda creds, request: _FlakyTransport(text_before, status)
     return app
 
@@ -456,8 +456,9 @@ def test_fast_tier_5xx_falls_back_to_strong(tmp_path: Path):
     assert json.loads(raw)["choices"][0]["message"]["content"] == "hello"
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
     assert record["ok"] is True and record["tier"] == "strong"
-    assert record["provider"] == "anthropic"
-    assert record["fallback"]["from"] == "kimi" and "503" in record["fallback"]["error"]
+    assert record["provider"] == app.config.strong.provider
+    assert record["fallback"]["from"] == app.config.fast.provider \
+        and "503" in record["fallback"]["error"]
 
 
 def test_fast_tier_5xx_stream_falls_back_before_output(tmp_path: Path):
@@ -470,7 +471,8 @@ def test_fast_tier_5xx_stream_falls_back_before_output(tmp_path: Path):
     assert status == 200
     assert '"content":"hello"' in raw.decode().replace(" ", "")
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert record["fallback"]["from"] == "kimi" and record["provider"] == "anthropic"
+    assert record["fallback"]["from"] == app.config.fast.provider
+    assert record["provider"] == app.config.strong.provider
 
 
 def test_no_fallback_after_partial_stream_output(tmp_path: Path):
@@ -489,8 +491,9 @@ def test_no_fallback_when_auth_is_dead(tmp_path: Path):
     from model_router.errors import ReloginRequired
 
     app = _flaky_fast(tmp_path, status=401)
-    fast = app.gateway._providers["kimi"]
-    fast.refresh = lambda creds: (_ for _ in ()).throw(ReloginRequired("kimi"))
+    fast = app.gateway._providers[app.config.fast.provider]
+    fast.refresh = lambda creds: (_ for _ in ()).throw(
+        ReloginRequired(app.config.fast.provider))
     status, _headers, raw = _post(app, {
         "model": "router-auto",
         "messages": [{"role": "user", "content": "fix typo"}],
@@ -552,12 +555,12 @@ def test_proxy_refuses_start_with_zero_auth(tmp_path: Path):
 def test_strict_startup_refuses_partial_auth(tmp_path: Path):
     from model_router.errors import NoSubscriptionAuth
 
-    store = TokenStore(tmp_path / "store")
-    store.save("kimi", Credentials(access="a", refresh="r", expires=0))
     cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
+    store = TokenStore(tmp_path / "store")
+    store.save(cfg.fast.provider, Credentials(access="a", refresh="r", expires=0))
     assert cfg.require_all_tiers is True
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
-    with pytest.raises(NoSubscriptionAuth, match="anthropic"):
+    with pytest.raises(NoSubscriptionAuth, match=cfg.strong.provider):
         app.check_auth()
 
 
@@ -605,10 +608,10 @@ def test_kimi_defaults_to_global_and_refresh_follows_stored_domain(monkeypatch):
 
 
 def test_strict_startup_all_ready(tmp_path: Path):
-    store = TokenStore(tmp_path / "store")
-    store.save("kimi", Credentials(access="a", refresh="r", expires=0))
-    store.save("anthropic", Credentials(access="a", refresh="r", expires=0))
     cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
+    store = TokenStore(tmp_path / "store")
+    for tier in (cfg.fast, cfg.strong):
+        store.save(tier.provider, Credentials(access="a", refresh="r", expires=0))
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
     status = app.check_auth()
     assert status["fast"]["ok"] and status["strong"]["ok"]
