@@ -37,14 +37,25 @@ def task_text(messages: list[dict]) -> str:
 
 
 class EscalationTracker:
-    """Per-session failure counting for weak-first-escalate (Switchyard auto-esc)."""
+    """Per-session failure counting for weak-first-escalate (Switchyard auto-esc).
+
+    Sessions are capped: the oldest idle session state is evicted so a
+    long-running proxy does not grow without bound.
+    """
+
+    MAX_SESSIONS = 1024
 
     def __init__(self, config: RouterConfig):
         self.config = config
         self._sessions: dict[str, dict] = {}
 
     def state_for(self, session: str) -> dict:
-        return self._sessions.setdefault(session, {"errors": 0, "escalated": False})
+        state = self._sessions.pop(session, None) or {"errors": 0, "escalated": False}
+        self._sessions[session] = state  # refresh recency order
+        while len(self._sessions) > self.MAX_SESSIONS:
+            oldest = next(iter(self._sessions))
+            self._sessions.pop(oldest)
+        return state
 
     def observe_request(self, session: str | None, messages: list[dict]) -> bool:
         """Count trailing tool errors + explicit signals. Returns escalated."""

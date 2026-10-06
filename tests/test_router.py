@@ -266,6 +266,49 @@ def test_gateway_401_refresh_once_then_relogin(tmp_path: Path):
         reopen()
 
 
+def test_gateway_serializes_concurrent_refreshes(tmp_path: Path):
+    import threading
+
+    store = TokenStore(tmp_path)
+    store.save("kimi", Credentials(access="expired", refresh="r", expires=1))
+    refreshes = []
+
+    class CountingProvider(create("kimi").__class__):
+        def refresh(self, creds):
+            refreshes.append(1)
+            from model_router.http import now_ms
+
+            import time as _time
+
+            _time.sleep(0.05)  # widen the race window
+            # far-future expiry so later loads skip refresh entirely
+            return Credentials(access=f"fresh-{len(refreshes)}", refresh="r",
+                               expires=now_ms() + 3600_000)
+
+    gateway = Gateway(RouterConfig(), store)
+    gateway._providers["kimi"] = CountingProvider()
+    threads = [threading.Thread(target=lambda: gateway.credentials("kimi"))
+               for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(refreshes) == 1  # one refresh under the lock, not four
+    assert store.load("kimi").access == "fresh-1"
+
+
+def test_escalation_tracker_evicts_oldest_sessions():
+    tracker = EscalationTracker(RouterConfig())
+    tracker.observe_request("s1", [{"role": "user", "content": "this isn't working"}])
+    assert tracker.state_for("s1")["escalated"] is True
+    for i in range(EscalationTracker.MAX_SESSIONS + 8):
+        tracker.observe_request(f"bulk-{i}", [{"role": "user", "content": "hi"}])
+    assert len(tracker._sessions) <= EscalationTracker.MAX_SESSIONS
+    assert "s1" not in tracker._sessions  # oldest evicted
+    state = tracker.state_for("s1")  # evicted state restarts clean
+    assert state["escalated"] is False
+
+
 def test_no_api_key_reads_in_source():
     """No env reads; key-shaped strings only where allowlisted (OAuth scope,
     Cursor endpoint path, config reject-guard, Meta's OAuth-derived mint)."""
@@ -381,6 +424,81 @@ def test_models_endpoint_lists_virtual_models(tmp_path: Path):
     status, _headers, raw = _get(_app(tmp_path), "/v1/models")
     assert status == 200
     assert [m["id"] for m in json.loads(raw)["data"]] == list(VIRTUAL_MODELS)
+
+
+class _FlakyTransport(ChatTransport):
+    def __init__(self, text_before="", status=503):
+        self.text_before = text_before
+        self.status = status
+
+    def run(self):
+        from model_router.providers.base import ChatChunk
+
+        if self.text_before:
+            yield ChatChunk(kind="delta", text=self.text_before)
+        raise HttpStatusError("POST", "https://provider.invalid", self.status)
+
+
+def _flaky_fast(tmp_path: Path, text_before="", status=503) -> ProxyApp:
+    app = _app(tmp_path)
+    fast = app.gateway._providers["kimi"]
+    fast.open_chat = lambda creds, request: _FlakyTransport(text_before, status)
+    return app
+
+
+def test_fast_tier_5xx_falls_back_to_strong(tmp_path: Path):
+    app = _flaky_fast(tmp_path)
+    status, _headers, raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "Fix this typo in README.md"}],
+    })
+    assert status == 200
+    assert json.loads(raw)["choices"][0]["message"]["content"] == "hello"
+    record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
+    assert record["ok"] is True and record["tier"] == "strong"
+    assert record["provider"] == "anthropic"
+    assert record["fallback"]["from"] == "kimi" and "503" in record["fallback"]["error"]
+
+
+def test_fast_tier_5xx_stream_falls_back_before_output(tmp_path: Path):
+    app = _flaky_fast(tmp_path)
+    status, _headers, raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "fix typo"}],
+        "stream": True,
+    })
+    assert status == 200
+    assert '"content":"hello"' in raw.decode().replace(" ", "")
+    record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
+    assert record["fallback"]["from"] == "kimi" and record["provider"] == "anthropic"
+
+
+def test_no_fallback_after_partial_stream_output(tmp_path: Path):
+    app = _flaky_fast(tmp_path, text_before="partial answer")
+    status, _headers, _raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "fix typo"}],
+        "stream": True,
+    })
+    assert status == 200  # headers already sent; error arrives as an SSE event
+    record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
+    assert record["ok"] is False and "fallback" not in record
+
+
+def test_no_fallback_when_auth_is_dead(tmp_path: Path):
+    from model_router.errors import ReloginRequired
+
+    app = _flaky_fast(tmp_path, status=401)
+    fast = app.gateway._providers["kimi"]
+    fast.refresh = lambda creds: (_ for _ in ()).throw(ReloginRequired("kimi"))
+    status, _headers, raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "fix typo"}],
+    })
+    assert status == 401  # relogin_required, not a silent strong-tier switch
+    assert b"relogin_required" in raw
+    record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
+    assert "fallback" not in record
 
 
 def test_chat_non_stream_and_request_log(tmp_path: Path):

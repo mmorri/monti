@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import TextIO
 
 from .errors import ReloginRequired, RouterError
+from .gateway import retryable_failure
 from .http import HttpStatusError
 from .providers.base import ChatRequest
 from .proxy import ProxyApp
+from .router import Route
 from .tools import TOOLS, WorkspaceTools
 
 
@@ -77,39 +79,58 @@ class TerminalAgent:
         for step in range(self.max_steps):
             if step and self.mode == "weak-first-escalate":
                 route, _ = self.app.router.route(self.messages, "router-auto", self.mode, self.session)
-            tier = getattr(self.app.config, route.tier)
-            print(f"[{route.tier} → {tier.provider}/{tier.model}]", file=self.diagnostic)
-            request = ChatRequest(messages=self.messages, model=tier.model, stream=True, tools=TOOLS)
-            transport, reopen = self.app.gateway.chat(tier.provider, request)
-            text, calls, usage = "", {}, {}
-            visible = False
-            for attempt in range(2):
-                try:
-                    for event in transport.run():
-                        if event.kind == "delta":
-                            visible = visible or bool(event.text)
-                            text += event.text
-                            print(event.text, end="", flush=True, file=self.output)
-                        elif event.kind == "tool_call":
-                            visible = True
-                            delta = event.tool_call
-                            index = delta.get("index", 0)
-                            call = calls.setdefault(index, {"id": "", "type": "function",
-                                                          "function": {"name": "", "arguments": ""}})
-                            if delta.get("id"):
-                                call["id"] = delta["id"]
-                            function = delta.get("function") or {}
-                            for key in ("name", "arguments"):
-                                call["function"][key] += function.get(key) or ""
-                        elif event.kind == "usage":
-                            usage.update(event.usage)
-                    break
-                except HttpStatusError as exc:
-                    if exc.status != 401 or visible:
-                        raise
-                    if attempt:
-                        raise ReloginRequired(tier.provider) from None
-                    transport = reopen()
+
+            def run_provider(tier):
+                """Stream one provider call; 401 refresh+retry before output."""
+                print(f"[{route.tier} → {tier.provider}/{tier.model}]",
+                      file=self.diagnostic)
+                request = ChatRequest(messages=self.messages, model=tier.model,
+                                      stream=True, tools=TOOLS)
+                transport, reopen = self.app.gateway.chat(tier.provider, request)
+                text, calls, usage = "", {}, {}
+                visible = False
+                for attempt in range(2):
+                    try:
+                        for event in transport.run():
+                            if event.kind == "delta":
+                                visible = visible or bool(event.text)
+                                text += event.text
+                                print(event.text, end="", flush=True, file=self.output)
+                            elif event.kind == "tool_call":
+                                visible = True
+                                delta = event.tool_call
+                                index = delta.get("index", 0)
+                                call = calls.setdefault(index, {"id": "", "type": "function",
+                                                                "function": {"name": "", "arguments": ""}})
+                                if delta.get("id"):
+                                    call["id"] = delta["id"]
+                                function = delta.get("function") or {}
+                                for key in ("name", "arguments"):
+                                    call["function"][key] += function.get(key) or ""
+                            elif event.kind == "usage":
+                                usage.update(event.usage)
+                        return text, calls, usage
+                    except HttpStatusError as exc:
+                        if exc.status != 401 or visible:
+                            raise
+                        if attempt:
+                            raise ReloginRequired(tier.provider) from None
+                        transport = reopen()
+                raise RouterError("provider stream ended unexpectedly")
+
+            try:
+                tier = getattr(self.app.config, route.tier)
+                text, calls, usage = run_provider(tier)
+            except (RouterError, HttpStatusError, OSError) as exc:
+                strong = self.app.config.strong
+                if (route.tier != "fast" or strong.provider == tier.provider
+                        or not retryable_failure(exc)):
+                    raise
+                print(f"[fast tier failed ({exc}); escalating to strong]",
+                      file=self.diagnostic)
+                route = Route("strong", route.mode, route.verdict, escalated=True)
+                text, calls, usage = run_provider(strong)
+                tier = strong
             if text:
                 print(file=self.output, flush=True)
             ordered = [calls[index] for index in sorted(calls)]

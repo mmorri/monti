@@ -12,7 +12,7 @@ from . import VIRTUAL_MODELS
 from .classifier import Classifier
 from .config import RouterConfig
 from .errors import NoSubscriptionAuth, ProviderDisabled, ReloginRequired, RouterError
-from .gateway import Gateway
+from .gateway import Gateway, retryable_failure
 from .http import HttpStatusError
 from .log import ClassificationLog, RequestLog
 from .providers.base import ChatRequest
@@ -85,6 +85,21 @@ class ProxyApp:
         return "".join(c.text for c in chunks if c.kind == "delta")
 
     # -- chat -----------------------------------------------------------
+    def _collect(self, request: ChatRequest, provider_id: str) -> list:
+        """One provider call with the single 401 refresh+retry."""
+        transport, reopen = self.gateway.chat(provider_id, request)
+        try:
+            return list(transport.run())
+        except HttpStatusError as exc:
+            if exc.status != 401:
+                raise
+            return list(reopen().run())
+
+    def _fallback_allowed(self, route, tier, exc: Exception) -> bool:
+        return (route.tier == "fast"
+                and self.config.strong.provider != tier.provider
+                and retryable_failure(exc))
+
     def chat_completion(self, body: dict, headers: dict[str, str]) -> dict:
         """Non-streaming completion; raises RouterError/HttpStatusError."""
         started = time.time()
@@ -98,24 +113,30 @@ class ProxyApp:
                   "tier": route.tier, "provider": tier.provider,
                   "provider_model": tier.model, "escalated": route.escalated,
                   "stream": False}
+        fallback: dict | None = None
         try:
             request = ChatRequest(
                 messages=body.get("messages", []), model=tier.model, stream=False,
                 temperature=body.get("temperature"), max_tokens=body.get("max_tokens"),
                 tools=body.get("tools"), tool_choice=body.get("tool_choice"),
             )
-            transport, reopen = self.gateway.chat(tier.provider, request)
             try:
-                chunks = list(transport.run())
-            except HttpStatusError as exc:
-                if exc.status != 401:
+                chunks = self._collect(request, tier.provider)
+            except (RouterError, HttpStatusError, OSError) as exc:
+                if not self._fallback_allowed(route, tier, exc):
                     raise
-                chunks = list(reopen().run())
-        except (RouterError, HttpStatusError) as exc:
+                # SPEC: on failure escalate one tier and retry.
+                fallback = {"from": tier.provider, "error": str(exc)}
+                tier = self.config.strong
+                chunks = self._collect(request, tier.provider)
+        except (RouterError, HttpStatusError, OSError) as exc:
             record.update({"ok": False, "error": str(exc),
                            "latency_ms": int((time.time() - started) * 1000)})
             self.requests.append(record)
             raise
+        if fallback:
+            record.update({"tier": "strong", "provider": tier.provider,
+                           "provider_model": tier.model, "fallback": fallback})
         text = "".join(c.text for c in chunks if c.kind == "delta")
         calls = {}
         for event in chunks:
@@ -165,6 +186,7 @@ class ProxyApp:
                   "stream": True}
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
+        emitted = False
 
         def chunk(delta: dict | None, finish: str | None = None) -> bytes:
             payload = {"id": completion_id, "object": "chat.completion.chunk",
@@ -173,47 +195,64 @@ class ProxyApp:
                                     "finish_reason": finish}]}
             return f"data: {json.dumps(payload)}\n\n".encode()
 
+        def relay(transport, reopen) -> None:
+            nonlocal emitted
+
+            def send(event) -> None:
+                nonlocal emitted
+                if event.kind == "delta" and event.text:
+                    emitted = True
+                    emit(chunk({"content": event.text}))
+                elif event.kind == "tool_call":
+                    emitted = True
+                    emit(chunk({"tool_calls": [event.tool_call]}))
+                elif event.kind == "finish":
+                    emit(chunk(None, event.finish_reason))
+                elif event.kind == "usage":
+                    record["usage"] = event.usage
+
+            stream = transport.run()
+            try:
+                while True:
+                    try:
+                        event = next(stream)
+                    except StopIteration:
+                        break
+                    send(event)
+            except HttpStatusError as exc:
+                if exc.status != 401 or emitted:
+                    raise
+                for event in reopen().run():
+                    send(event)
+
+        fallback: dict | None = None
         try:
             request = ChatRequest(
                 messages=body.get("messages", []), model=tier.model, stream=True,
                 temperature=body.get("temperature"), max_tokens=body.get("max_tokens"),
                 tools=body.get("tools"), tool_choice=body.get("tool_choice"),
             )
-            transport, reopen = self.gateway.chat(tier.provider, request)
             emit(chunk({"role": "assistant"}))
             try:
-                stream = transport.run()
-                while True:
-                    try:
-                        event = next(stream)
-                    except StopIteration:
-                        break
-                    if event.kind == "delta" and event.text:
-                        emit(chunk({"content": event.text}))
-                    elif event.kind == "tool_call":
-                        emit(chunk({"tool_calls": [event.tool_call]}))
-                    elif event.kind == "finish":
-                        emit(chunk(None, event.finish_reason))
-                    elif event.kind == "usage":
-                        record["usage"] = event.usage
-            except HttpStatusError as exc:
-                if exc.status != 401:
+                transport, reopen = self.gateway.chat(tier.provider, request)
+                relay(transport, reopen)
+            except (RouterError, HttpStatusError, OSError) as exc:
+                # Escalate one tier only when nothing has reached the client.
+                if not self._fallback_allowed(route, tier, exc) or emitted:
                     raise
-                for event in reopen().run():
-                    if event.kind == "delta" and event.text:
-                        emit(chunk({"content": event.text}))
-                    elif event.kind == "tool_call":
-                        emit(chunk({"tool_calls": [event.tool_call]}))
-                    elif event.kind == "finish":
-                        emit(chunk(None, event.finish_reason))
-                    elif event.kind == "usage":
-                        record["usage"] = event.usage
+                fallback = {"from": tier.provider, "error": str(exc)}
+                tier = self.config.strong
+                transport, reopen = self.gateway.chat(tier.provider, request)
+                relay(transport, reopen)
             emit(b"data: [DONE]\n\n")
-        except (RouterError, HttpStatusError) as exc:
+        except (RouterError, HttpStatusError, OSError) as exc:
             record.update({"ok": False, "error": str(exc),
                            "latency_ms": int((time.time() - started) * 1000)})
             self.requests.append(record)
             raise
+        if fallback:
+            record.update({"tier": "strong", "provider": tier.provider,
+                           "provider_model": tier.model, "fallback": fallback})
         record.update({"ok": True, "latency_ms": int((time.time() - started) * 1000)})
         self.requests.append(record)
 

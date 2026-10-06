@@ -45,10 +45,13 @@ Inside a session:
 /exit
 ```
 
-The agent can list and read workspace files, write files, and run shell commands.
-Writes show a content preview and require confirmation; shell commands also
-require confirmation. File tools stay inside `--workspace` (the current directory
-by default). Approved shell commands have normal operating-system access.
+The agent can list and read workspace files, search them (name glob or
+content regex), write files, make targeted edits, and run shell commands.
+Writes and edits show a preview and require confirmation; shell commands
+also require confirmation. File tools stay inside `--workspace` (the
+current directory by default). Approved shell commands have normal
+operating-system access. Transient fast-tier failures (429/5xx/network)
+are retried once on the strong tier before surfacing an error.
 Use `--yes` to authorize writes and commands without prompting:
 
 ```sh

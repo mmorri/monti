@@ -98,6 +98,74 @@ def test_shell_runs_in_workspace_and_reports_exit(tmp_path):
     assert not (tmp_path / 'denied').exists()
 
 
+def test_edit_file_unique_ambiguous_and_missing(tmp_path):
+    tools = WorkspaceTools(tmp_path, lambda _: True)
+    (tmp_path / 'a.txt').write_text('alpha beta gamma\nbeta again\n')
+    assert tools.execute('edit_file', '{"path":"a.txt","old":"beta gamma","new":"BETA"}') \
+        == 'Edited a.txt (1 replacement(s))'
+    assert (tmp_path / 'a.txt').read_text() == 'alpha BETA\nbeta again\n'
+    # 'beta' now appears once -> unique replace succeeds without replace_all
+    assert tools.execute('edit_file', '{"path":"a.txt","old":"beta again","new":"x"}') \
+        == 'Edited a.txt (1 replacement(s))'
+    (tmp_path / 'c.txt').write_text('dup dup\n')
+    assert tools.execute('edit_file', '{"path":"c.txt","old":"dup","new":"x"}') \
+        .startswith('Error:')
+    assert tools.execute('edit_file', '{"path":"c.txt","old":"nope","new":"x"}') \
+        .startswith('Error:')
+    assert tools.execute('edit_file',
+        '{"path":"c.txt","old":"dup","new":"x","replace_all":true}') == \
+        'Edited c.txt (2 replacement(s))'
+    denied = WorkspaceTools(tmp_path, lambda _: False)
+    (tmp_path / 'b.txt').write_text('keep me')
+    assert denied.execute('edit_file',
+        '{"path":"b.txt","old":"keep","new":"change"}').startswith('Denied by user')
+    assert (tmp_path / 'b.txt').read_text() == 'keep me'
+
+
+def test_find_and_grep_skip_hidden_and_respect_scope(tmp_path):
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'app.py').write_text('def main():\n    return TARGET\n')
+    (tmp_path / 'notes.md').write_text('mention TARGET too')
+    (tmp_path / '.secret').write_text('TARGET hidden')
+    tools = WorkspaceTools(tmp_path, lambda _: True)
+    found = tools.execute('find_files', '{"pattern":"*.py"}')
+    assert found == 'src/app.py' and 'notes.md' not in found
+    grep = tools.execute('grep_files', '{"pattern":"TARGET"}')
+    assert 'src/app.py:2' in grep and 'notes.md:1' in grep and '.secret' not in grep
+    scoped = tools.execute('grep_files', '{"pattern":"TARGET","path":"src"}')
+    assert 'src/app.py:2' in scoped and 'notes.md' not in scoped
+    py_only = tools.execute('grep_files', '{"pattern":"TARGET","glob":"*.md"}')
+    assert 'notes.md:1' in py_only and 'app.py' not in py_only
+    assert tools.execute('grep_files', '{"pattern":"["}').startswith('Error:')
+    assert tools.execute('grep_files', '{"pattern":"nothing-matches"}') == 'no matches'
+
+
+def test_agent_escalates_fast_tier_failure_to_strong(tmp_path):
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, provider, request):
+            from model_router.providers.base import ChatChunk
+            self.calls.append((provider, request.model))
+            if provider == 'kimi':
+                return Transport([HttpStatusError('POST', 'https://x.invalid', 503)]), None
+            return Transport([ChatChunk(kind='delta', text='recovered.')]), None
+
+    config = RouterConfig()  # fast=kimi, strong=anthropic
+    app = SimpleNamespace(config=config, gateway=Gateway(),
+                          router=Router(config, Classifier()),
+                          requests=SimpleNamespace(append=lambda _r: None))
+    agent = TerminalAgent(app, tmp_path, output=io.StringIO(), diagnostic=io.StringIO(),
+                          input_fn=lambda _: 'n', yes=True)
+    agent.turn('hello')
+    assert agent.output.getvalue() == 'recovered.\n'
+    providers = [call[0] for call in app.gateway.calls]
+    assert providers == ['kimi', 'anthropic']
+    assert app.gateway.calls[1][1] == config.strong.model
+    assert 'escalating to strong' in agent.diagnostic.getvalue()
+
+
 def test_agent_401_retry_and_second_401(tmp_path):
     error = HttpStatusError('POST', 'https://provider.invalid', 401)
     agent, _, _ = agent_with(tmp_path, [[error], [ChatChunk(kind='delta', text='ok')]])
