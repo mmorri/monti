@@ -17,9 +17,10 @@ quick tasks.
 
 ## What it does
 
-- **Classifies** each request's difficulty (model-based classifier with a
-  heuristic fallback) and routes: trivial → everyday, easy → moderate,
-  medium → high, hard → very_high.
+- **Classifies free**: difficulty classification (trivial/easy/medium/hard)
+  runs on a free-first pool — the Muse contributor tier (near-free quota in
+  exchange for training on prompts; only ~2k task excerpts are sent) leads,
+  with high-quota flash wallets behind it. Routing itself costs ~nothing.
 - **Rotates wallets**: each tier is a pool of provider/model candidates in
   your preference order. A 429/quota refusal cools that wallet down for
   `cooldown_seconds` (default 300s) and the next wallet serves — same

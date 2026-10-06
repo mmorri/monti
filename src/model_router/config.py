@@ -52,6 +52,11 @@ class RouterConfig:
     # same quality band, different subscription wallets. List order is
     # wallet preference — the first available candidate serves.
     tiers: dict[str, list[Tier]] = field(default_factory=_default_pools)
+    # Classification pool: the request that runs before every auto-routed
+    # call. Ordered free-first — e.g. the Muse contributor tier (near-free
+    # quota in exchange for training on prompts), then high-quota flash
+    # wallets. Falls back to everyday-tier wallets when all are cooling.
+    classifier: list[Tier] = field(default_factory=list)
     default_mode: str = "auto"
     # Strict startup: refuse unless every tier has at least one logged-in,
     # transport-ready candidate. A router with missing pieces is not a router.
@@ -118,6 +123,16 @@ class RouterConfig:
             signals=tuple(str(s) for s in esc.get("signals", _DEFAULT_ESCALATION_SIGNALS)),
         )
         cfg.provider_options = dict(raw.get("providers") or {})
+        classifier = raw.get("classifier") or []
+        if isinstance(classifier, dict):
+            # Single-wallet shorthand: classifier: {provider, model}.
+            classifier = [classifier]
+        pool: list[Tier] = []
+        for item in classifier if isinstance(classifier, list) else []:
+            if isinstance(item, dict) and item.get("provider"):
+                pool.append(Tier(provider=str(item["provider"]),
+                                 model=str(item.get("model", ""))))
+        cfg.classifier = pool
         cfg.log_dir = str(raw.get("log_dir", cfg.log_dir))
         cfg.port = int(raw.get("port", cfg.port))
         _reject_api_keys(raw, str(path))

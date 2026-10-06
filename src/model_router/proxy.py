@@ -93,31 +93,62 @@ class ProxyApp:
         return True
 
     # -- classifier model ---------------------------------------------
+    def _classifier_wallets(self) -> list:
+        """Candidate wallets for classification, free-first.
+
+        The configured pool leads (Muse contributor tier = near-free quota,
+        then high-quota flash wallets); everyday-tier wallets back it up so
+        a cooled-down classifier never blocks routing.
+        """
+        seen: set[tuple[str, str]] = set()
+        wallets = []
+        backups = self.config.tiers.get("everyday", [])
+        for candidate in list(self.config.classifier) + backups:
+            key = (candidate.provider, candidate.model)
+            if key not in seen:
+                wallets.append(candidate)
+                seen.add(key)
+        return wallets
+
     def _classifier_model_fn(self, excerpt: str):
         from .classifier import PROMPT
 
-        # Cheapest available wallet serves classification.
-        candidate = None
-        for tier in TIERS:
-            candidate, _index = self.router.pick_candidate(tier, self.available)
-            if candidate is not None:
-                break
-        if candidate is None:
+        candidates = [w for w in self._classifier_wallets()
+                      if self.available(w.provider)]
+        last_error: Exception | None = None
+        for candidate in candidates:
+            request = ChatRequest(
+                messages=[{"role": "user", "content": f"{PROMPT}\n\nTask:\n{excerpt}"}],
+                model=candidate.model, stream=False, max_tokens=16, temperature=0,
+            )
+            try:
+                transport, reopen = self.gateway.chat(candidate.provider, request)
+            except (RouterError, OSError):
+                continue
+            try:
+                chunks = list(transport.run())
+            except HttpStatusError as exc:
+                if exc.status != 401:
+                    last_error = exc
+                    continue
+                try:
+                    chunks = list(reopen().run())
+                except (HttpStatusError, RouterError, OSError) as retry_exc:
+                    last_error = retry_exc
+                    continue
+            except (RouterError, OSError) as exc:
+                last_error = exc
+                continue
+            return "".join(c.text for c in chunks if c.kind == "delta")
+        # Classifier unreachable: heuristic fallback covers the request, but
+        # surface the failure when nothing was even available.
+        if not candidates:
             raise NoSubscriptionAuth(
                 "no logged-in provider available for classification; "
                 "run `monti login <provider>` first")
-        request = ChatRequest(
-            messages=[{"role": "user", "content": f"{PROMPT}\n\nTask:\n{excerpt}"}],
-            model=candidate.model, stream=False, max_tokens=16, temperature=0,
-        )
-        transport, reopen = self.gateway.chat(candidate.provider, request)
-        try:
-            chunks = list(transport.run())
-        except HttpStatusError as exc:
-            if exc.status != 401:
-                raise
-            chunks = list(reopen().run())
-        return "".join(c.text for c in chunks if c.kind == "delta")
+        if last_error is not None:
+            raise last_error
+        raise NoSubscriptionAuth("no usable wallet for classification")
 
     # -- chat -----------------------------------------------------------
     def _collect(self, request: ChatRequest, provider_id: str) -> list:

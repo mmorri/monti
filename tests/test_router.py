@@ -796,6 +796,50 @@ def test_legacy_fast_strong_config_rejected(tmp_path: Path):
         RouterConfig.load(legacy)
 
 
+def test_classifier_parsing_and_wallet_order(tmp_path: Path):
+    from model_router.config import RouterConfig, Tier
+    from model_router.proxy import ProxyApp
+    from model_router.store import TokenStore, Credentials
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "tiers:\n"
+        "  everyday: [{provider: kimi, model: kimi-for-coding-highspeed}]\n"
+        "  moderate: [{provider: kimi, model: kimi-for-coding}]\n"
+        "  high: [{provider: kimi, model: k3}]\n"
+        "  very_high: [{provider: kimi, model: k3}]\n"
+        "classifier:\n"
+        "  - {provider: muse, model: muse-spark-1.3-contributor}\n"
+        "  - {provider: zai, model: glm-5.3-flash}\n")
+    cfg = RouterConfig.load(cfg_file)
+    assert cfg.classifier == [Tier("muse", "muse-spark-1.3-contributor"),
+                              Tier("zai", "glm-5.3-flash")]
+    # Single-dict shorthand still parses.
+    single = tmp_path / "single.yaml"
+    single.write_text(cfg_file.read_text().replace(
+        "  - {provider: muse, model: muse-spark-1.3-contributor}\n"
+        "  - {provider: zai, model: glm-5.3-flash}\n",
+        "  {provider: muse, model: m}\n"))
+    assert RouterConfig.load(single).classifier == [Tier("muse", "m")]
+
+    store = TokenStore(tmp_path / "store")
+    for provider in ("kimi", "muse", "zai"):
+        store.save(provider, Credentials(access="a", refresh="r", expires=0))
+    app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
+    # Configured free-first pool leads; everyday wallets back it up, deduped.
+    order = [(w.provider, w.model) for w in app._classifier_wallets()]
+    assert order[:2] == [("muse", "muse-spark-1.3-contributor"),
+                         ("zai", "glm-5.3-flash")]
+    assert ("kimi", "kimi-for-coding-highspeed") in order
+    assert order.count(("kimi", "kimi-for-coding")) == 0  # non-everyday tiers excluded
+    # Cooled-down pool wallets are skipped at call time, everyday survives.
+    app.gateway.mark_cooldown("muse", seconds=60)
+    app.gateway.mark_cooldown("zai", seconds=60)
+    usable = [(w.provider, w.model) for w in app._classifier_wallets()
+              if app.available(w.provider)]
+    assert usable == [("kimi", "kimi-for-coding-highspeed")]
+
+
 def test_repo_config_pools_reference_known_providers():
     from model_router.providers import REGISTRY
 
