@@ -42,7 +42,7 @@ def _default_pools() -> dict[str, list[Tier]]:
         "everyday": [Tier("kimi", "kimi-for-coding-highspeed")],
         "moderate": [Tier("kimi", "kimi-for-coding")],
         "high": [Tier("muse", "muse-spark-1.3")],
-        "very_high": [Tier("anthropic", "claude-opus-4-5")],
+        "very_high": [Tier("anthropic", "claude-fable-5-1")],
     }
 
 

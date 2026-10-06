@@ -11,15 +11,22 @@ tiers:
   moderate:
     - { provider: kimi,     model: "kimi-for-coding" }
     - { provider: windsurf, model: "gpt-5.5" }
+    # NOTE: gpt-5.5 retires from OpenAI-side Codex on 2026-10-14; if Windsurf
+    # follows, replace with whatever `monti models` lists (e.g. gpt-6-sol).
   high:
-    - { provider: zai,  model: "glm-5.3" }
-    - { provider: kimi, model: "k3" }
-    - { provider: muse, model: "muse-spark-1.3" }
+    - { provider: zai,       model: "glm-5.3" }
+    - { provider: anthropic, model: "claude-sonnet-5-5" }
+    - { provider: kimi,      model: "k3" }
+    - { provider: muse,      model: "muse-spark-1.3" }
+    - { provider: openai,    model: "gpt-6-sol" }
   very_high:
     - { provider: anthropic, model: "claude-fable-5-1" }
-    - { provider: windsurf,  model: "claude-fable-5-1" }
+    - { provider: anthropic, model: "claude-opus-5-5" }
     - { provider: openai,    model: "gpt-6-astra" }
     - { provider: muse,       model: "muse-spark-1.3" }
+    # Unverified — uncomment after `monti models` confirms the UID form
+    # (Windsurf UIDs usually look like claude-opus-4-7-medium):
+    # - { provider: windsurf,  model: "claude-fable-5-1" }
 policy:
   default_mode: auto
   # modes: auto | everyday-only | moderate-only | high-only | very-high-only

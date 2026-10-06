@@ -773,6 +773,17 @@ def test_legacy_fast_strong_config_rejected(tmp_path: Path):
         RouterConfig.load(legacy)
 
 
+def test_repo_config_pools_reference_known_providers():
+    from model_router.providers import REGISTRY
+
+    cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
+    for tier in ("everyday", "moderate", "high", "very_high"):
+        assert cfg.tiers[tier], f"tier '{tier}' must not be empty"
+        for candidate in cfg.tiers[tier]:
+            assert candidate.provider in REGISTRY, candidate
+            assert candidate.model and not any(ch.isspace() for ch in candidate.model)
+
+
 def test_cooldown_configurable(tmp_path: Path):
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text(
