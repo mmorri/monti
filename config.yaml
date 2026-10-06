@@ -1,7 +1,7 @@
 tiers:
   # Pin one model per tier; `monti models` lists each logged-in provider's
   # live catalog, /model strong anthropic/<model> switches mid-session.
-  fast:   { provider: kimi,       model: "kimi-latest" }
+  fast:   { provider: kimi,       model: "kimi-for-coding" }
   strong: { provider: anthropic,  model: "claude-sonnet-4-5" }
 policy:
   default_mode: auto

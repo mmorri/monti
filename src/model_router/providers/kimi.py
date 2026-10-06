@@ -199,8 +199,12 @@ class KimiProvider(Provider):
             raise ReloginRequired(self.id) from exc
 
     def open_chat(self, creds: Credentials, request: ChatRequest, **kwargs) -> ChatTransport:
+        # The coding gateway sits behind a bot-signature firewall (Cloudflare
+        # 1010) and rejects non-CLI clients — the Kimi CLI identity headers
+        # are mandatory on chat calls, not just during OAuth.
         return OpenAICompatTransport(
-            base_url=self._gateway_for(creds), access_token=creds.access, request=request)
+            base_url=self._gateway_for(creds), access_token=creds.access,
+            request=request, extra_headers=self._headers())
 
     def list_models(self, creds: Credentials) -> list[str]:
         return list_openai_models(self._gateway_for(creds), creds.access,

@@ -36,7 +36,7 @@ Inside a session:
 /mode fast
 /mode strong
 /mode weak-first-escalate
-/model fast kimi/kimi-latest
+/model fast kimi/kimi-for-coding
 /model strong xai/grok-4.5
 /models
 /status
@@ -58,7 +58,7 @@ Use `--yes` to authorize writes and commands without prompting:
 monti --mode fast --yes "fix the failing tests"
 cat error.log | monti --mode fast "explain this failure"
 monti --workspace /path/to/project --mode strong "review the code"
-monti --mode fast --model kimi/kimi-latest "explain this project"
+monti --mode fast --model kimi/kimi-for-coding "explain this project"
 ```
 
 Piped input is appended to the task. Without a terminal, approval-dependent tools

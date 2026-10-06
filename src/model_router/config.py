@@ -33,7 +33,7 @@ class Escalation:
 
 @dataclass
 class RouterConfig:
-    fast: Tier = field(default_factory=lambda: Tier("kimi", "kimi-latest"))
+    fast: Tier = field(default_factory=lambda: Tier("kimi", "kimi-for-coding"))
     strong: Tier = field(default_factory=lambda: Tier("anthropic", "claude-sonnet-4-5"))
     default_mode: str = "auto"
     # Strict startup: refuse unless every configured tier is logged in AND

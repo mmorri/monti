@@ -285,7 +285,7 @@ def test_cli_one_shot_with_piped_context(tmp_path, monkeypatch, capsys):
     assert main(['--workspace', str(tmp_path), '--mode', 'fast', 'explain this']) == 0
     captured = capsys.readouterr()
     assert captured.out == 'Explanation.\n'
-    assert 'kimi/kimi-latest' in captured.err
+    assert 'kimi/kimi-for-coding' in captured.err
     assert requests[-1].messages[1]['content'] == 'explain this\n\nError: example failure'
 
 
