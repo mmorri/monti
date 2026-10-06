@@ -10,9 +10,10 @@ from pathlib import Path
 
 from . import VIRTUAL_MODELS
 from .classifier import Classifier
-from .config import RouterConfig
-from .errors import NoSubscriptionAuth, ProviderDisabled, ReloginRequired, RouterError
-from .gateway import Gateway, retryable_failure
+from .config import TIERS, RouterConfig
+from .errors import (NoSubscriptionAuth, ProviderDisabled, ProviderTransportUnavailable,
+                     ReloginRequired, RouterError)
+from .gateway import Gateway, quota_exhausted, retryable_failure
 from .http import HttpStatusError
 from .log import ClassificationLog, RequestLog
 from .providers.base import ChatRequest
@@ -42,40 +43,74 @@ class ProxyApp:
 
     # -- startup ------------------------------------------------------
     def check_auth(self) -> dict[str, dict]:
+        from .providers import REGISTRY
+
         status = self.gateway.tier_status()
         if not self.store.providers():
             raise NoSubscriptionAuth(
-                "no subscription auth found; run `model-router login <provider>` first "
-                "(providers: anthropic, copilot, cursor, kimi, muse, openai, "
-                "windsurf, xai, zai)")
+                "no subscription auth found; run `monti login <provider>` first "
+                f"(providers: {', '.join(sorted(REGISTRY))})")
         for tier, entry in status.items():
-            if not entry["ok"]:
-                print(f"[{tier}] {entry['provider']}: disabled ({entry['transport']})")
+            ready = [c for c in entry["candidates"] if c["ok"]]
+            if ready:
+                extra = f" (+{len(ready) - 1} more wallet(s))" if len(ready) > 1 else ""
+                print(f"[{tier}] {ready[0]['provider']}/{ready[0]['model']}: ready{extra}")
             else:
-                print(f"[{tier}] {entry['provider']}/{entry['model']}: ready")
+                reasons = "; ".join(
+                    f"{c['provider']}: {c['transport']}" for c in entry["candidates"])
+                print(f"[{tier}] disabled ({reasons})")
         if self.config.require_all_tiers:
             missing = {t: e for t, e in status.items() if not e["ok"]}
             if missing:
+                logins = sorted({c["provider"] for e in missing.values()
+                                 for c in e["candidates"] if c["transport"] == "no-auth"})
                 details = "; ".join(
-                    f"{tier} tier (provider '{e['provider']}'): {e['transport']}"
+                    f"{tier} tier (" + ", ".join(
+                        f"{c['provider']}: {c['transport']}" for c in e["candidates"]) + ")"
                     for tier, e in missing.items())
-                logins = ", ".join(
-                    f"`model-router login {e['provider']}`" for e in missing.values())
+                hint = ("; log in with " + ", ".join(f"`monti login {p}`" for p in logins)
+                        if logins else "")
                 raise NoSubscriptionAuth(
-                    f"not all tiers are ready ({details}); log in with {logins} "
+                    f"not all tiers are ready ({details}){hint} "
                     "(or set policy.require_all_tiers: false to allow degraded starts)")
         return status
+
+    def available(self, provider_id: str) -> bool:
+        """A wallet is usable when logged in, not cooling down, and its chat
+        transport is ported. Constructors perform no network, so this is cheap."""
+        if self.gateway.cooling(provider_id):
+            return False
+        creds = self.store.load(provider_id)
+        if not creds:
+            return False
+        try:
+            self.gateway.provider_for(provider_id).open_chat(
+                creds, ChatRequest(messages=[], model=""))
+        except ProviderTransportUnavailable:
+            return False
+        except Exception:  # noqa: BLE001 — constructors don't validate; fail at runtime
+            return True
+        return True
 
     # -- classifier model ---------------------------------------------
     def _classifier_model_fn(self, excerpt: str):
         from .classifier import PROMPT
 
-        tier = self.config.fast
+        # Cheapest available wallet serves classification.
+        candidate = None
+        for tier in TIERS:
+            candidate, _index = self.router.pick_candidate(tier, self.available)
+            if candidate is not None:
+                break
+        if candidate is None:
+            raise NoSubscriptionAuth(
+                "no logged-in provider available for classification; "
+                "run `monti login <provider>` first")
         request = ChatRequest(
             messages=[{"role": "user", "content": f"{PROMPT}\n\nTask:\n{excerpt}"}],
-            model=tier.model, stream=False, max_tokens=16, temperature=0,
+            model=candidate.model, stream=False, max_tokens=16, temperature=0,
         )
-        transport, reopen = self.gateway.chat(tier.provider, request)
+        transport, reopen = self.gateway.chat(candidate.provider, request)
         try:
             chunks = list(transport.run())
         except HttpStatusError as exc:
@@ -95,10 +130,30 @@ class ProxyApp:
                 raise
             return list(reopen().run())
 
-    def _fallback_allowed(self, route, tier, exc: Exception) -> bool:
-        return (route.tier == "fast"
-                and self.config.strong.provider != tier.provider
-                and retryable_failure(exc))
+    def _attempt_plan(self, route) -> list:
+        """Same-tier wallets first, then higher rungs (re-checked live)."""
+        return self.router.ladder_from(route.tier, route.candidate_index,
+                                       self.available)
+
+    def _note_failure(self, candidate, exc: Exception) -> tuple[bool, str | None]:
+        """Common failure handling: returns (continue_ladder, skip_provider).
+
+        skip_provider names a dead wallet whose remaining entries to skip;
+        None means only this candidate failed."""
+        if isinstance(exc, ReloginRequired):
+            return True, candidate.provider  # dead grant: skip the whole wallet
+        if quota_exhausted(exc):
+            self.gateway.mark_cooldown(candidate.provider)
+        if retryable_failure(exc) or quota_exhausted(exc):
+            return True, None
+        return False, None
+
+    def _request_for(self, body: dict, model: str, stream: bool) -> ChatRequest:
+        return ChatRequest(
+            messages=body.get("messages", []), model=model, stream=stream,
+            temperature=body.get("temperature"), max_tokens=body.get("max_tokens"),
+            tools=body.get("tools"), tool_choice=body.get("tool_choice"),
+        )
 
     def chat_completion(self, body: dict, headers: dict[str, str]) -> dict:
         """Non-streaming completion; raises RouterError/HttpStatusError."""
@@ -107,36 +162,46 @@ class ProxyApp:
         header_mode = _header(headers, "x-router-mode")
         session = _header(headers, "x-router-session")
         route, verdict = self.router.route(
-            body.get("messages", []), model, header_mode, session)
-        tier = getattr(self.config, route.tier)
+            body.get("messages", []), model, header_mode, session,
+            available=self.available)
         record = {"model": model, "mode": route.mode, "verdict": verdict.verdict,
-                  "tier": route.tier, "provider": tier.provider,
-                  "provider_model": tier.model, "escalated": route.escalated,
-                  "stream": False}
-        fallback: dict | None = None
-        try:
-            request = ChatRequest(
-                messages=body.get("messages", []), model=tier.model, stream=False,
-                temperature=body.get("temperature"), max_tokens=body.get("max_tokens"),
-                tools=body.get("tools"), tool_choice=body.get("tool_choice"),
-            )
+                  "tier": route.tier, "provider": route.candidate.provider,
+                  "provider_model": route.candidate.model,
+                  "escalated": route.escalated, "stream": False}
+        attempts_log: list[dict] = []
+        dead: set[str] = set()
+        chunks = used = None
+        last_error: Exception | None = None
+        for tier_name, candidate, _index in self._attempt_plan(route):
+            if candidate.provider in dead or not self.available(candidate.provider):
+                continue
             try:
-                chunks = self._collect(request, tier.provider)
+                chunks = self._collect(
+                    self._request_for(body, candidate.model, False), candidate.provider)
             except (RouterError, HttpStatusError, OSError) as exc:
-                if not self._fallback_allowed(route, tier, exc):
-                    raise
-                # SPEC: on failure escalate one tier and retry.
-                fallback = {"from": tier.provider, "error": str(exc)}
-                tier = self.config.strong
-                chunks = self._collect(request, tier.provider)
-        except (RouterError, HttpStatusError, OSError) as exc:
-            record.update({"ok": False, "error": str(exc),
+                last_error = exc
+                attempts_log.append({"tier": tier_name, "provider": candidate.provider,
+                                     "model": candidate.model, "error": str(exc)})
+                proceed, skip = self._note_failure(candidate, exc)
+                if skip:
+                    dead.add(skip)
+                if not proceed:
+                    break
+                continue
+            used = (tier_name, candidate)
+            break
+        if used is None:
+            record.update({"ok": False, "attempts": attempts_log,
+                           "error": str(last_error) if last_error else "no available candidate",
                            "latency_ms": int((time.time() - started) * 1000)})
             self.requests.append(record)
-            raise
-        if fallback:
-            record.update({"tier": "strong", "provider": tier.provider,
-                           "provider_model": tier.model, "fallback": fallback})
+            if last_error is not None:
+                raise last_error
+            raise NoSubscriptionAuth("no tier has a usable candidate")
+        tier_name, candidate = used
+        if attempts_log:
+            record.update({"tier": tier_name, "provider": candidate.provider,
+                           "provider_model": candidate.model, "attempts": attempts_log})
         text = "".join(c.text for c in chunks if c.kind == "delta")
         calls = {}
         for event in chunks:
@@ -178,12 +243,12 @@ class ProxyApp:
         header_mode = _header(headers, "x-router-mode")
         session = _header(headers, "x-router-session")
         route, verdict = self.router.route(
-            body.get("messages", []), model, header_mode, session)
-        tier = getattr(self.config, route.tier)
+            body.get("messages", []), model, header_mode, session,
+            available=self.available)
         record = {"model": model, "mode": route.mode, "verdict": verdict.verdict,
-                  "tier": route.tier, "provider": tier.provider,
-                  "provider_model": tier.model, "escalated": route.escalated,
-                  "stream": True}
+                  "tier": route.tier, "provider": route.candidate.provider,
+                  "provider_model": route.candidate.model,
+                  "escalated": route.escalated, "stream": True}
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         emitted = False
@@ -225,34 +290,51 @@ class ProxyApp:
                 for event in reopen().run():
                     send(event)
 
-        fallback: dict | None = None
+        attempts_log: list[dict] = []
+        dead: set[str] = set()
+        used = None
+        last_error: Exception | None = None
         try:
-            request = ChatRequest(
-                messages=body.get("messages", []), model=tier.model, stream=True,
-                temperature=body.get("temperature"), max_tokens=body.get("max_tokens"),
-                tools=body.get("tools"), tool_choice=body.get("tool_choice"),
-            )
             emit(chunk({"role": "assistant"}))
-            try:
-                transport, reopen = self.gateway.chat(tier.provider, request)
-                relay(transport, reopen)
-            except (RouterError, HttpStatusError, OSError) as exc:
-                # Escalate one tier only when nothing has reached the client.
-                if not self._fallback_allowed(route, tier, exc) or emitted:
-                    raise
-                fallback = {"from": tier.provider, "error": str(exc)}
-                tier = self.config.strong
-                transport, reopen = self.gateway.chat(tier.provider, request)
-                relay(transport, reopen)
+            for tier_name, candidate, _index in self._attempt_plan(route):
+                if candidate.provider in dead or not self.available(candidate.provider):
+                    continue
+                try:
+                    transport, reopen = self.gateway.chat(
+                        candidate.provider,
+                        self._request_for(body, candidate.model, True))
+                    relay(transport, reopen)
+                except (RouterError, HttpStatusError, OSError) as exc:
+                    last_error = exc
+                    # Only switch wallets while nothing has reached the client.
+                    if emitted:
+                        raise
+                    attempts_log.append({"tier": tier_name, "provider": candidate.provider,
+                                         "model": candidate.model, "error": str(exc)})
+                    proceed, skip = self._note_failure(candidate, exc)
+                    if skip:
+                        dead.add(skip)
+                    if not proceed:
+                        raise
+                    continue
+                used = (tier_name, candidate)
+                break
+            if used is None:
+                if last_error is not None:
+                    raise last_error
+                raise NoSubscriptionAuth("no tier has a usable candidate")
             emit(b"data: [DONE]\n\n")
         except (RouterError, HttpStatusError, OSError) as exc:
-            record.update({"ok": False, "error": str(exc),
+            record.update({"ok": False, "attempts": attempts_log,
+                           "error": str(exc),
                            "latency_ms": int((time.time() - started) * 1000)})
             self.requests.append(record)
             raise
-        if fallback:
-            record.update({"tier": "strong", "provider": tier.provider,
-                           "provider_model": tier.model, "fallback": fallback})
+        if attempts_log:
+            tier_name, candidate = used
+            record.update({"tier": tier_name, "provider": candidate.provider,
+                           "provider_model": candidate.model,
+                           "attempts": attempts_log})
         record.update({"ok": True, "latency_ms": int((time.time() - started) * 1000)})
         self.requests.append(record)
 

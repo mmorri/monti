@@ -8,8 +8,7 @@ import uuid
 from pathlib import Path
 from typing import TextIO
 
-from .errors import ReloginRequired, RouterError
-from .gateway import retryable_failure
+from .errors import NoSubscriptionAuth, ReloginRequired, RouterError
 from .http import HttpStatusError
 from .providers.base import ChatRequest
 from .proxy import ProxyApp
@@ -75,18 +74,20 @@ class TerminalAgent:
 
     def _turn(self, prompt: str) -> None:
         self.messages.append({"role": "user", "content": prompt})
-        route, _ = self.app.router.route(self.messages, "router-auto", self.mode, self.session)
+        route, _ = self.app.router.route(self.messages, "router-auto", self.mode,
+                                         self.session, available=self.app.available)
         for step in range(self.max_steps):
             if step and self.mode == "weak-first-escalate":
-                route, _ = self.app.router.route(self.messages, "router-auto", self.mode, self.session)
+                route, _ = self.app.router.route(self.messages, "router-auto", self.mode,
+                                                 self.session, available=self.app.available)
 
-            def run_provider(tier):
-                """Stream one provider call; 401 refresh+retry before output."""
-                print(f"[{route.tier} → {tier.provider}/{tier.model}]",
+            def run_candidate(tier_name, candidate):
+                """Stream one wallet; 401 refresh+retry before output."""
+                print(f"[{tier_name} → {candidate.provider}/{candidate.model}]",
                       file=self.diagnostic)
-                request = ChatRequest(messages=self.messages, model=tier.model,
+                request = ChatRequest(messages=self.messages, model=candidate.model,
                                       stream=True, tools=TOOLS)
-                transport, reopen = self.app.gateway.chat(tier.provider, request)
+                transport, reopen = self.app.gateway.chat(candidate.provider, request)
                 text, calls, usage = "", {}, {}
                 visible = False
                 for attempt in range(2):
@@ -114,23 +115,43 @@ class TerminalAgent:
                         if exc.status != 401 or visible:
                             raise
                         if attempt:
-                            raise ReloginRequired(tier.provider) from None
+                            raise ReloginRequired(candidate.provider) from None
                         transport = reopen()
                 raise RouterError("provider stream ended unexpectedly")
 
-            try:
-                tier = getattr(self.app.config, route.tier)
-                text, calls, usage = run_provider(tier)
-            except (RouterError, HttpStatusError, OSError) as exc:
-                strong = self.app.config.strong
-                if (route.tier != "fast" or strong.provider == tier.provider
-                        or not retryable_failure(exc)):
-                    raise
-                print(f"[fast tier failed ({exc}); escalating to strong]",
-                      file=self.diagnostic)
-                route = Route("strong", route.mode, route.verdict, escalated=True)
-                text, calls, usage = run_provider(strong)
-                tier = strong
+            # Walk the ladder: remaining wallets in this tier, then higher rungs.
+            dead: set[str] = set()
+            text = calls = usage = None
+            used = None
+            last_error: Exception | None = None
+            plan = self.app.router.ladder_from(
+                route.tier, route.candidate_index, self.app.available)
+            for tier_name, candidate, _index in plan:
+                if candidate.provider in dead or not self.app.available(candidate.provider):
+                    continue
+                try:
+                    text, calls, usage = run_candidate(tier_name, candidate)
+                except (RouterError, HttpStatusError, OSError) as exc:
+                    last_error = exc
+                    proceed, skip = self.app._note_failure(candidate, exc)
+                    if skip:
+                        dead.add(skip)
+                    if not proceed:
+                        raise
+                    print(f"[{tier_name} {candidate.provider} failed; trying next wallet]",
+                          file=self.diagnostic)
+                    continue
+                used = (tier_name, candidate)
+                break
+            if used is None:
+                if last_error is not None:
+                    raise last_error
+                raise NoSubscriptionAuth("no tier has a usable candidate")
+            tier_name, candidate = used
+            if tier_name != route.tier:
+                route = Route(tier_name, candidate,
+                              self.app.router.config.tiers[tier_name].index(candidate),
+                              route.mode, route.verdict, escalated=True)
             if text:
                 print(file=self.output, flush=True)
             ordered = [calls[index] for index in sorted(calls)]
@@ -141,8 +162,8 @@ class TerminalAgent:
                 assistant["tool_calls"] = ordered
             self.messages.append(assistant)
             self.app.requests.append({"session": self.session, "interface": "cli",
-                                      "tier": route.tier, "provider": tier.provider,
-                                      "provider_model": tier.model, "mode": self.mode,
+                                      "tier": route.tier, "provider": candidate.provider,
+                                      "provider_model": candidate.model, "mode": self.mode,
                                       "verdict": route.verdict, "step": step, "ok": True,
                                       "usage": usage, "tool_calls": len(ordered)})
             if not ordered:
@@ -172,11 +193,17 @@ class TerminalAgent:
                 if command in ("/exit", "/quit"):
                     return 0
                 if command == "/help":
-                    print("/mode auto|fast|strong|weak-first-escalate\n/model [fast|strong] <provider>/<model>\n"
+                    print("/mode auto|everyday|moderate|high|very-high|weak-first-escalate\n"
+                          "/model [everyday|moderate|high|very-high] <provider>/<model>\n"
                           "/models  /status  /clear  /exit", file=self.diagnostic)
                 elif command == "/mode":
-                    from .config import MODES
-                    mode = {"fast": "fast-only", "strong": "strong-only"}.get(argument, argument)
+                    from .config import MODES, TIERS
+                    from .router import _normalize_mode
+                    mode = _normalize_mode(argument) if argument else argument
+                    # Bare tier names pin that tier: "/mode high" == high-only.
+                    tier_key = mode.replace("-", "_") if mode else ""
+                    if tier_key in TIERS:
+                        mode = tier_key.replace("_", "-") + "-only"
                     if mode in MODES:
                         self.mode = mode
                     print(f"Mode: {self.mode}" if mode in MODES or not argument else
@@ -186,20 +213,32 @@ class TerminalAgent:
                         tier_name, target = argument.split(maxsplit=1)
                         provider, model = target.split("/", 1)
                         from .providers import REGISTRY
-                        if tier_name not in ("fast", "strong") or provider not in REGISTRY or not model:
+                        tier_key = tier_name.replace("-", "_")
+                        from .config import TIERS, Tier
+                        if tier_key not in TIERS or provider not in REGISTRY or not model:
                             raise ValueError
-                        from .config import Tier
-                        setattr(self.app.config, tier_name, Tier(provider, model))
-                        print(f"{tier_name}: {provider}/{model}", file=self.diagnostic)
+                        # Replace the tier pool with the explicit pin.
+                        self.app.config.tiers[tier_key] = [Tier(provider, model)]
+                        print(f"{tier_key}: {provider}/{model}", file=self.diagnostic)
                     except ValueError:
-                        print("Usage: /model fast|strong provider/model", file=self.diagnostic)
+                        print("Usage: /model everyday|moderate|high|very-high provider/model",
+                              file=self.diagnostic)
                 elif command in ("/models", "/model", "/status"):
                     from .cli import _print_catalog
                     for name, entry in self.app.gateway.tier_status().items():
-                        print(f"{name}: {entry['provider']}/{entry['model']} · {entry['transport']}",
-                              file=self.diagnostic)
-                        if entry["auth"]:
-                            _print_catalog(self.app.gateway, self.app.store, entry["provider"])
+                        ready = [c for c in entry["candidates"] if c["ok"]]
+                        if ready:
+                            summary = ", ".join(
+                                f"{c['provider']}/{c['model']}" for c in ready)
+                            print(f"{name}: {summary} · ready", file=self.diagnostic)
+                            for candidate in ready:
+                                _print_catalog(self.app.gateway, self.app.store,
+                                               candidate["provider"])
+                        else:
+                            reasons = "; ".join(
+                                f"{c['provider']}: {c['transport']}"
+                                for c in entry["candidates"])
+                            print(f"{name}: disabled ({reasons})", file=self.diagnostic)
                 elif command == "/clear":
                     self.clear()
                     print("Conversation cleared.", file=self.diagnostic)

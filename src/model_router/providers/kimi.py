@@ -46,6 +46,12 @@ def hosts_for(domain: str) -> tuple[str, str]:
     return DOMAINS.get(domain.strip().lower(), DOMAINS[DEFAULT_DOMAIN])
 
 
+# Live catalog observed on the kimi.ai coding gateway (chat serves these;
+# /models rejects subscription tokens, so this is the documented fallback).
+KNOWN_CODING_MODELS = ("k3", "k3-256k", "kimi-for-coding",
+                       "kimi-for-coding-highspeed")
+
+
 def _device_id(config_dir: Path) -> str:
     path = config_dir / DEVICE_ID_FILENAME
     try:
@@ -207,5 +213,11 @@ class KimiProvider(Provider):
             request=request, extra_headers=self._headers())
 
     def list_models(self, creds: Credentials) -> list[str]:
-        return list_openai_models(self._gateway_for(creds), creds.access,
+        live = list_openai_models(self._gateway_for(creds), creds.access,
                                   extra_headers=self._headers())
+        if live:
+            return live
+        # The coding gateway rejects subscription tokens on /models (401)
+        # while chat works fine — fall back to the catalog observed live
+        # from this gateway (verified 2026-10-05).
+        return list(KNOWN_CODING_MODELS)

@@ -118,20 +118,28 @@ def _print_catalog(gateway, store, provider_id: str, indent: str = "  ") -> None
 
 
 def cmd_models(args) -> int:
+    from .config import TIERS
     from .gateway import Gateway
     try:
         gateway = Gateway(load_config(args.config), _store())
         store = gateway.store
         for tier, entry in gateway.tier_status().items():
-            print(f"{tier}: {entry['provider']}/{entry['model']} · {entry['transport']}")
-            if entry["auth"]:
-                _print_catalog(gateway, store, entry["provider"])
-        others = [p for p in store.providers()
-                  if p not in {gateway.config.fast.provider, gateway.config.strong.provider}]
-        for provider_id in others:
-            print(f"logged in: {provider_id}")
+            ready = [c for c in entry["candidates"] if c["ok"]]
+            if ready:
+                print(f"{tier}: " + " · ".join(
+                    f"{c['provider']}/{c['model']}" for c in ready))
+                for candidate in ready:
+                    _print_catalog(gateway, store, candidate["provider"])
+            else:
+                reasons = "; ".join(
+                    f"{c['provider']}: {c['transport']}" for c in entry["candidates"])
+                print(f"{tier}: disabled ({reasons})")
+        pooled = {c.provider for tier in TIERS
+                  for c in gateway.config.tiers.get(tier, [])}
+        for provider_id in [p for p in store.providers() if p not in pooled]:
+            print(f"logged in (not in any tier pool): {provider_id}")
             _print_catalog(gateway, store, provider_id)
-        print("Modes: auto, fast, strong, weak-first-escalate")
+        print("Modes: auto, everyday, moderate, high, very-high, weak-first-escalate")
         return 0
     except (ValueError, OSError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
@@ -141,8 +149,9 @@ def cmd_models(args) -> int:
 def cmd_chat(args) -> int:
     from contextlib import redirect_stdout
     from .agent import TerminalAgent
-    from .config import Tier
+    from .config import TIERS, Tier
     from .proxy import ProxyApp
+    from .router import _normalize_mode
 
     try:
         config = load_config(args.config)
@@ -155,18 +164,26 @@ def cmd_chat(args) -> int:
             provider, separator, model = args.model.partition("/")
             if not separator or provider not in REGISTRY or not model:
                 raise ValueError("--model must be provider/model")
-            setattr(config, args.tier, Tier(provider, model))
-        mode = {"fast": "fast-only", "strong": "strong-only"}.get(args.mode, args.mode)
+            tier_key = args.tier.replace("-", "_")
+            if tier_key not in TIERS:
+                raise ValueError("--tier must be one of everyday, moderate, high, very-high")
+            config.tiers[tier_key] = [Tier(provider, model)]
+        mode = _normalize_mode(args.mode) if args.mode else None
+        tier_key = mode.replace("-", "_") if mode else ""
+        if tier_key in TIERS:
+            mode = tier_key.replace("_", "-") + "-only"
         mode = mode or config.default_mode
         app = ProxyApp(config)
         # Pinned sessions only require the selected tier; automatic routing follows startup policy.
         with redirect_stdout(sys.stderr):
-            if mode in ("fast-only", "strong-only"):
-                tier = "fast" if mode == "fast-only" else "strong"
-                entry = app.gateway.tier_status()[tier]
+            pinned_tier = app.router.tier_for_mode(mode)
+            if pinned_tier is not None:
+                entry = app.gateway.tier_status()[pinned_tier]
                 if not entry["ok"]:
-                    raise NoSubscriptionAuth(f"{tier}: {entry['transport']}; "
-                                             f"run `monti login {entry['provider']}`")
+                    first = entry["candidates"][0]["provider"] if entry["candidates"] else "?"
+                    raise NoSubscriptionAuth(
+                        f"{pinned_tier}: no usable candidate; "
+                        f"run `monti login {first}`")
             else:
                 app.check_auth()
         agent = TerminalAgent(app, workspace, mode=mode, yes=args.yes, max_steps=args.max_steps)
@@ -215,9 +232,12 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("prompt", nargs="*", help="task; omit for an interactive session")
     chat.add_argument("--config", help="path to config.yaml")
     chat.add_argument("--workspace", default=".", help="workspace directory (default: current directory)")
-    chat.add_argument("--mode", choices=("auto", "fast", "strong", "fast-only", "strong-only", "weak-first-escalate"))
+    chat.add_argument("--mode", choices=("auto", "everyday", "moderate", "high", "very-high",
+                                         "everyday-only", "moderate-only", "high-only",
+                                         "very-high-only", "weak-first-escalate"))
     chat.add_argument("--model", help="override a tier with provider/model")
-    chat.add_argument("--tier", choices=("fast", "strong"), default="fast", help="tier to override with --model")
+    chat.add_argument("--tier", choices=("everyday", "moderate", "high", "very-high"),
+                      default="moderate", help="tier to override with --model")
     chat.add_argument("--yes", "-y", action="store_true", help="authorize file writes and shell commands without prompts")
     chat.add_argument("--max-steps", type=int, default=20, help="maximum model calls per task")
     chat.set_defaults(func=cmd_chat)

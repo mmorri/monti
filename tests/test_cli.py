@@ -10,6 +10,7 @@ from model_router.classifier import Classifier
 from model_router.cli import main
 from model_router.config import RouterConfig
 from model_router.errors import ReloginRequired
+from model_router.gateway import retryable_failure
 from model_router.http import HttpStatusError
 from model_router.providers.anthropic import to_messages_payload, _non_stream_chunks as anthropic_chunks
 from model_router.providers.base import ChatChunk, ChatRequest
@@ -38,10 +39,20 @@ def agent_with(tmp_path, responses, *, input_fn=lambda _: 'n', yes=False):
             requests.append(json.loads(json.dumps(request.messages)))
             return Transport(responses.pop(0)), lambda: Transport(responses.pop(0))
 
+    def _note_failure(candidate, exc):
+        # Production logic minus the cooldown write (the fake gateway has none).
+        if isinstance(exc, ReloginRequired):
+            return True, candidate.provider
+        if retryable_failure(exc):
+            return True, None
+        return False, None
+
     config = RouterConfig()
     app = SimpleNamespace(config=config, gateway=Gateway(),
                           router=Router(config, Classifier()),
-                          requests=SimpleNamespace(append=logs.append))
+                          requests=SimpleNamespace(append=logs.append),
+                          available=lambda provider: True,
+                          _note_failure=_note_failure)
     agent = TerminalAgent(app, tmp_path, output=io.StringIO(), diagnostic=io.StringIO(),
                           input_fn=input_fn, yes=yes)
     return agent, requests, logs
@@ -140,7 +151,7 @@ def test_find_and_grep_skip_hidden_and_respect_scope(tmp_path):
     assert tools.execute('grep_files', '{"pattern":"nothing-matches"}') == 'no matches'
 
 
-def test_agent_escalates_fast_tier_failure_to_strong(tmp_path):
+def test_agent_walks_ladder_on_wallet_failure(tmp_path):
     class Gateway:
         def __init__(self):
             self.calls = []
@@ -152,18 +163,21 @@ def test_agent_escalates_fast_tier_failure_to_strong(tmp_path):
                 return Transport([HttpStatusError('POST', 'https://x.invalid', 503)]), None
             return Transport([ChatChunk(kind='delta', text='recovered.')]), None
 
-    config = RouterConfig()  # fast=kimi, strong=anthropic
+    config = RouterConfig()  # moderate[0]=kimi, high[0]=muse
     app = SimpleNamespace(config=config, gateway=Gateway(),
                           router=Router(config, Classifier()),
-                          requests=SimpleNamespace(append=lambda _r: None))
+                          requests=SimpleNamespace(append=lambda _r: None),
+                          available=lambda provider: True,
+                          _note_failure=lambda candidate, exc: (
+                              (True, None) if retryable_failure(exc) else (False, None)))
     agent = TerminalAgent(app, tmp_path, output=io.StringIO(), diagnostic=io.StringIO(),
                           input_fn=lambda _: 'n', yes=True)
-    agent.turn('hello')
+    agent.turn('hello')  # easy -> moderate(kimi 503) -> high(muse)
     assert agent.output.getvalue() == 'recovered.\n'
     providers = [call[0] for call in app.gateway.calls]
-    assert providers == ['kimi', 'anthropic']
-    assert app.gateway.calls[1][1] == config.strong.model
-    assert 'escalating to strong' in agent.diagnostic.getvalue()
+    assert providers == ['kimi', 'muse']
+    assert app.gateway.calls[1][1] == config.tiers["high"][0].model
+    assert 'trying next wallet' in agent.diagnostic.getvalue()
 
 
 def test_agent_401_retry_and_second_401(tmp_path):
@@ -171,8 +185,10 @@ def test_agent_401_retry_and_second_401(tmp_path):
     agent, _, _ = agent_with(tmp_path, [[error], [ChatChunk(kind='delta', text='ok')]])
     agent.turn('hello')
     assert agent.output.getvalue() == 'ok\n'
-    agent, _, _ = agent_with(tmp_path, [[error], [error]])
-    with pytest.raises(ReloginRequired, match='RELOGIN_REQUIRED:kimi'):
+    # A dead grant rotates through every wallet (2 pops per wallet: initial
+    # transport + 401 reopen) before surfacing RELOGIN_REQUIRED.
+    agent, _, _ = agent_with(tmp_path, [[error]] * 6)
+    with pytest.raises(ReloginRequired, match='RELOGIN_REQUIRED:anthropic'):
         agent.turn('hello')
 
 
@@ -217,20 +233,22 @@ def test_latest_task_and_pinned_mode_skip_classifier():
     router = Router(RouterConfig(), Classifier(model_fn=lambda text: seen.append(text) or 'easy'))
     messages = [{'role': 'system', 'content': 'architecture design ' * 300},
                 {'role': 'user', 'content': 'fix typo'}]
-    assert router.route(messages, 'router-auto')[0].tier == 'fast'
+    assert router.route(messages, 'router-auto')[0].tier == 'moderate'
     assert seen == ['user: fix typo']
-    router.route(messages, 'router-strong')
+    router.route(messages, 'router-high')
     assert len(seen) == 1
     assert Classifier(model_fn=lambda _: 'invalid').classify('design a system').verdict == 'hard'
 
 
-def test_weak_first_starts_fast_and_does_not_recount_history():
+def test_weak_first_starts_unescalated_and_does_not_recount_history():
     router = Router(RouterConfig(), Classifier())
     messages = [{'role': 'user', 'content': 'design architecture'}]
-    assert router.route(messages, '', 'weak-first-escalate', 's')[0].tier == 'fast'
+    route, _ = router.route(messages, '', 'weak-first-escalate', 's')
+    assert route.tier == 'very_high' and not route.escalated
     messages.append({'role': 'tool', 'content': 'Error: failed'})
     for _ in range(4):
-        assert router.route(messages, '', 'weak-first-escalate', 's')[0].tier == 'fast'
+        route, _ = router.route(messages, '', 'weak-first-escalate', 's')
+        assert route.tier == 'very_high' and not route.escalated
 
 
 def test_config_discovery_cwd_then_home(monkeypatch, tmp_path):
@@ -242,7 +260,10 @@ def test_config_discovery_cwd_then_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home" / ".config" / "model-router").mkdir(parents=True)
     user_cfg = tmp_path / "home" / ".config" / "model-router" / "config.yaml"
-    user_cfg.write_text("tiers:\n  fast: {provider: muse, model: m}\n")
+    user_cfg.write_text("tiers:\n  everyday: [{provider: muse, model: m}]\n"
+                        "  moderate: [{provider: muse, model: m}]\n"
+                        "  high: [{provider: muse, model: m}]\n"
+                        "  very_high: [{provider: muse, model: m}]\n")
     assert cli._config_path(None) == user_cfg
     # ./config.yaml in cwd wins over the user config
     (empty_cwd / "config.yaml").write_text("port: 9999\n")
@@ -253,11 +274,12 @@ def test_config_discovery_cwd_then_home(monkeypatch, tmp_path):
 
 
 def test_interactive_commands_and_error_recovery(tmp_path):
-    prompts = iter(['/mode strong', 'hello', '/clear', '/exit'])
-    agent, _, _ = agent_with(tmp_path, [[HttpStatusError('POST', 'https://x.invalid', 500)]],
+    prompts = iter(['/mode high', 'hello', '/clear', '/exit'])
+    agent, _, _ = agent_with(tmp_path, [[HttpStatusError('POST', 'https://x.invalid', 500)],
+                                        [HttpStatusError('POST', 'https://x.invalid', 500)]],
                               input_fn=lambda _: next(prompts))
     assert agent.run() == 0
-    assert agent.mode == 'strong-only' and len(agent.messages) == 1
+    assert agent.mode == 'high-only' and len(agent.messages) == 1
     assert 'Error:' in agent.diagnostic.getvalue()
 
 
@@ -266,7 +288,7 @@ def test_cli_dispatch_default_and_prompt(monkeypatch):
     monkeypatch.setattr('model_router.cli.cmd_chat', lambda args: seen.append(args) or 0)
     assert main([]) == 0
     assert seen[-1].prompt == []
-    assert main(['fix the tests', '--mode', 'fast', '--yes']) == 0
+    assert main(['fix the tests', '--mode', 'moderate', '--yes']) == 0
     assert seen[-1].prompt == ['fix the tests'] and seen[-1].yes
 
 
@@ -277,7 +299,7 @@ def test_escalation_counts_errors_across_tool_rounds():
         messages.extend([{"role": "assistant", "content": None},
                          {"role": "tool", "content": f"Error: failed {i}"}])
         route, _ = router.route(messages, "", "weak-first-escalate", "s")
-        assert route.tier == ("strong" if i == 2 else "fast")
+        assert route.tier == ("high" if i == 2 else "moderate")
 
 
 def test_cli_one_shot_with_piped_context(tmp_path, monkeypatch, capsys):
@@ -299,9 +321,14 @@ def test_cli_one_shot_with_piped_context(tmp_path, monkeypatch, capsys):
             return Transport([ChatChunk(kind='delta', text='Explanation.')])
 
     app.gateway._providers['kimi'] = Provider()
+    # The fake app needs the pool-aware helpers the agent now uses.
+    from model_router.gateway import retryable_failure as _retryable
+    app.available = lambda provider: True
+    app._note_failure = lambda candidate, exc: ((True, None) if _retryable(exc)
+                                                else (False, None))
     monkeypatch.setattr('model_router.proxy.ProxyApp', lambda _: app)
     monkeypatch.setattr('sys.stdin', io.StringIO('Error: example failure'))
-    assert main(['--workspace', str(tmp_path), '--mode', 'fast', 'explain this']) == 0
+    assert main(['--workspace', str(tmp_path), '--mode', 'moderate', 'explain this']) == 0
     captured = capsys.readouterr()
     assert captured.out == 'Explanation.\n'
     assert 'kimi/kimi-for-coding' in captured.err

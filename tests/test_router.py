@@ -15,7 +15,7 @@ import pytest
 
 from model_router import VIRTUAL_MODELS
 from model_router.classifier import Classifier, heuristic_classify, parse_verdict
-from model_router.config import RouterConfig
+from model_router.config import RouterConfig, Tier
 from model_router.errors import ProviderTransportUnavailable, ReloginRequired, RouterError
 from model_router.gateway import Gateway
 from model_router.http import HttpStatusError
@@ -142,20 +142,62 @@ def _router(**overrides):
 def test_auto_routes_by_verdict():
     router = _router()
     route, _ = router.route([{"role": "user", "content": "fix typo"}], "router-auto")
-    assert route.tier == "fast"
+    assert route.tier == "everyday"
+    assert (route.candidate.provider, route.candidate_index) == (
+        RouterConfig().tiers["everyday"][0].provider, 0)
     route, _ = router.route([{"role": "user", "content": "design architecture"}], "router-auto")
-    assert route.tier == "strong"
+    assert route.tier == "very_high"
+    route, _ = router.route([{"role": "user", "content": "debug this failing test"}], "router-auto")
+    assert route.tier == "high"
 
 
 def test_header_and_model_overrides():
     router = _router()
     msgs = [{"role": "user", "content": "design architecture"}]
-    route, _ = router.route(msgs, "router-fast")
-    assert route.tier == "fast"
-    route, _ = router.route(msgs, "router-auto", header_mode="strong-only")
-    assert (route.tier, route.mode) == ("strong", "strong-only")
+    route, _ = router.route(msgs, "router-everyday")
+    assert route.tier == "everyday"
+    route, _ = router.route(msgs, "router-auto", header_mode="very-high-only")
+    assert (route.tier, route.mode) == ("very_high", "very-high-only")
+    route, _ = router.route(msgs, "router-auto", header_mode="very_high-only")
+    assert route.tier == "very_high"
     with pytest.raises(ValueError):
         router.route(msgs, "router-auto", header_mode="bogus")
+
+
+def test_pool_prefers_first_available_wallet():
+    cfg = RouterConfig()
+    cfg.tiers["high"] = [Tier("kimi", "k3"), Tier("muse", "muse-spark-1.3")]
+    router = Router(cfg, Classifier(model_fn=None, log_fn=lambda _r: None))
+    # No filter: first wallet serves.
+    route, _ = router.route([{"role": "user", "content": "debug this bug"}], "router-auto")
+    assert (route.tier, route.candidate_index) == ("high", 0)
+    assert route.candidate.provider == "kimi"
+    # Only the second wallet is available: route picks it, not the first.
+    route, _ = router.route([{"role": "user", "content": "debug this bug"}],
+                            "router-auto", available=lambda p: p == "muse")
+    assert route.tier == "high"
+    assert route.candidate_index == 1
+    # Nothing available anywhere: fail closed with a login hint.
+    from model_router.errors import NoSubscriptionAuth
+    with pytest.raises(NoSubscriptionAuth):
+        router.route([{"role": "user", "content": "debug this bug"}],
+                     "router-auto", available=lambda _p: False)
+
+
+def test_ladder_walks_same_tier_then_up():
+    cfg = RouterConfig()
+    router = Router(cfg, Classifier(model_fn=None, log_fn=lambda _r: None))
+    plan = router.ladder_from("moderate", 0)
+    names = [(tier, cand.provider) for tier, cand, _idx in plan]
+    assert names[0][0] == "moderate"
+    tiers_seen = [tier for tier, _p in names]
+    assert tiers_seen == sorted(tiers_seen, key=("everyday", "moderate", "high", "very_high").index)
+    # Starting past the end of a tier's pool skips straight to higher rungs.
+    plan = router.ladder_from("moderate", 99)
+    assert plan and plan[0][0] == "high"
+    # very_high is the ceiling: the ladder never steps down or wraps.
+    plan = router.ladder_from("very_high", 0)
+    assert [tier for tier, _c, _i in plan] == ["very_high"]
 
 
 def _tool_error(n: int):
@@ -168,11 +210,30 @@ def test_weak_first_escalate_on_tool_errors():
     router = Router(cfg, Classifier(model_fn=None, log_fn=lambda _r: None))
     route, _ = router.route(_tool_error(3), "router-auto",
                             header_mode="weak-first-escalate", session="s1")
-    assert route.tier == "strong" and route.escalated
-    # sticky within the session
+    # "do it" is easy -> moderate; escalation climbs exactly one rung.
+    assert route.tier == "high" and route.escalated
+    # The session stays escalated: a trivial task still climbs one rung
+    # (everyday -> moderate) instead of serving the bottom tier.
     route, _ = router.route([{"role": "user", "content": "fix typo"}], "router-auto",
                             header_mode="weak-first-escalate", session="s1")
-    assert route.tier == "strong"
+    assert route.tier == "moderate" and route.escalated
+    # escalation never climbs past the top rung
+    router2 = Router(cfg, Classifier(model_fn=None, log_fn=lambda _r: None))
+    router2.tracker.observe_request("top", _tool_error(9))
+    route, _ = router2.route([{"role": "user", "content": "design architecture"}],
+                             "router-auto", header_mode="weak-first-escalate",
+                             session="top")
+    assert route.tier == "very_high" and route.escalated
+
+
+def test_empty_tier_degrades_to_lower_rung():
+    cfg = RouterConfig()
+    router = Router(cfg, Classifier(model_fn=None, log_fn=lambda _r: None))
+    # high tier fully unavailable -> nearest lower servable rung (moderate).
+    available = lambda provider: provider not in {c.provider for c in cfg.tiers["high"]}
+    route, _ = router.route([{"role": "user", "content": "debug this bug"}],
+                            "router-auto", available=available)
+    assert route.tier == "moderate"
 
 
 def test_weak_first_escalate_signal_and_no_session():
@@ -340,10 +401,13 @@ class StubTransport(ChatTransport):
 
 
 def _app(tmp_path: Path, text="hello") -> ProxyApp:
+    from model_router.config import TIERS
+
     cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
     store = TokenStore(tmp_path / "store")
-    for tier in (cfg.fast, cfg.strong):  # stub whichever providers config names
-        store.save(tier.provider, Credentials(access="a", refresh="r", expires=0))
+    providers = {c.provider for tier in TIERS for c in cfg.tiers.get(tier, [])}
+    for provider_id in providers:  # stub every wallet the pools name
+        store.save(provider_id, Credentials(access="a", refresh="r", expires=0))
 
     class StubProvider:
         def __init__(self, provider):
@@ -360,8 +424,8 @@ def _app(tmp_path: Path, text="hello") -> ProxyApp:
 
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
     app.classifier.model_fn = None  # deterministic heuristic in tests
-    for tier in (cfg.fast, cfg.strong):
-        app.gateway._providers[tier.provider] = StubProvider(tier.provider)
+    for provider_id in providers:
+        app.gateway._providers[provider_id] = StubProvider(provider_id)
     return app
 
 
@@ -439,15 +503,24 @@ class _FlakyTransport(ChatTransport):
         raise HttpStatusError("POST", "https://provider.invalid", self.status)
 
 
-def _flaky_fast(tmp_path: Path, text_before="", status=503) -> ProxyApp:
-    app = _app(tmp_path)
-    fast = app.gateway._providers[app.config.fast.provider]
-    fast.open_chat = lambda creds, request: _FlakyTransport(text_before, status)
+def _flaky_provider(app: ProxyApp, provider_id: str, text_before="",
+                      status=503) -> ProxyApp:
+    stub = app.gateway._providers[provider_id]
+    stub.open_chat = lambda creds, request: _FlakyTransport(text_before, status)
     return app
 
 
-def test_fast_tier_5xx_falls_back_to_strong(tmp_path: Path):
-    app = _flaky_fast(tmp_path)
+def _first_two_wallets(app: ProxyApp, tier: str) -> tuple[str, str]:
+    pool = app.config.tiers[tier]
+    assert len(pool) >= 2, "test needs a two-wallet tier pool"
+    return pool[0].provider, pool[1].provider
+
+
+def test_same_tier_wallet_rotation_on_503(tmp_path: Path):
+    # First everyday wallet 503s; the second wallet in the SAME tier serves.
+    app = _app(tmp_path)
+    first, second = _first_two_wallets(app, "everyday")
+    _flaky_provider(app, first)
     status, _headers, raw = _post(app, {
         "model": "router-auto",
         "messages": [{"role": "user", "content": "Fix this typo in README.md"}],
@@ -455,14 +528,18 @@ def test_fast_tier_5xx_falls_back_to_strong(tmp_path: Path):
     assert status == 200
     assert json.loads(raw)["choices"][0]["message"]["content"] == "hello"
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert record["ok"] is True and record["tier"] == "strong"
-    assert record["provider"] == app.config.strong.provider
-    assert record["fallback"]["from"] == app.config.fast.provider \
-        and "503" in record["fallback"]["error"]
+    assert record["ok"] is True and record["tier"] == "everyday"
+    assert record["provider"] == second
+    assert [a["provider"] for a in record["attempts"]] == [first]
+    assert "503" in record["attempts"][0]["error"]
 
 
-def test_fast_tier_5xx_stream_falls_back_before_output(tmp_path: Path):
-    app = _flaky_fast(tmp_path)
+def test_climb_to_next_rung_when_tier_is_down(tmp_path: Path):
+    # Whole everyday pool 503s; moderate serves via its surviving wallet
+    # (the shared kimi stub is flaky in every tier, so windsurf answers).
+    app = _app(tmp_path)
+    for provider_id in {c.provider for c in app.config.tiers["everyday"]}:
+        _flaky_provider(app, provider_id)
     status, _headers, raw = _post(app, {
         "model": "router-auto",
         "messages": [{"role": "user", "content": "fix typo"}],
@@ -471,12 +548,68 @@ def test_fast_tier_5xx_stream_falls_back_before_output(tmp_path: Path):
     assert status == 200
     assert '"content":"hello"' in raw.decode().replace(" ", "")
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert record["fallback"]["from"] == app.config.fast.provider
-    assert record["provider"] == app.config.strong.provider
+    assert record["tier"] == "moderate"
+    assert record["provider"] == app.config.tiers["moderate"][1].provider
+    assert {a["tier"] for a in record["attempts"]} == {"everyday", "moderate"}
+
+
+def test_429_cools_down_and_rotation_skips_it(tmp_path: Path):
+    app = _app(tmp_path)
+    first, second = _first_two_wallets(app, "everyday")
+    _flaky_provider(app, first, status=429)
+    status, _headers, _raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "fix typo"}],
+    })
+    assert status == 200
+    assert app.gateway.cooling(first)  # quota-drained wallet leaves rotation
+    assert not app.gateway.cooling(second)
+    # Next request routes straight to the surviving wallet.
+    route, _ = app.router.route([{"role": "user", "content": "fix typo"}],
+                                "router-auto", available=app.available)
+    assert route.candidate.provider == second and route.candidate_index == 1
+
+
+def test_dead_wallet_is_skipped_but_tier_survives(tmp_path: Path):
+    # 401 + dead refresh on the first wallet rotates within the tier (200),
+    # because a dead grant is a wallet problem, not a request problem.
+    from model_router.errors import ReloginRequired
+
+    app = _app(tmp_path)
+    first, second = _first_two_wallets(app, "everyday")
+    _flaky_provider(app, first, status=401)
+    app.gateway._providers[first].refresh = lambda creds: (_ for _ in ()).throw(
+        ReloginRequired(first))
+    status, _headers, raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "fix typo"}],
+    })
+    assert status == 200
+    record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
+    assert record["provider"] == second
+    assert "RELOGIN_REQUIRED" in record["attempts"][0]["error"]
+
+
+def test_all_wallets_dead_surfaces_401(tmp_path: Path):
+    from model_router.errors import ReloginRequired
+
+    app = _app(tmp_path)
+    for provider_id in list(app.gateway._providers):
+        _flaky_provider(app, provider_id, status=401)
+        app.gateway._providers[provider_id].refresh = (
+            lambda creds, p=provider_id: (_ for _ in ()).throw(ReloginRequired(p)))
+    status, _headers, raw = _post(app, {
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "fix typo"}],
+    })
+    assert status == 401  # every wallet dead: relogin, not a silent switch
+    assert b"relogin_required" in raw
 
 
 def test_no_fallback_after_partial_stream_output(tmp_path: Path):
-    app = _flaky_fast(tmp_path, text_before="partial answer")
+    app = _app(tmp_path)
+    first, _second = _first_two_wallets(app, "everyday")
+    _flaky_provider(app, first, text_before="partial answer")
     status, _headers, _raw = _post(app, {
         "model": "router-auto",
         "messages": [{"role": "user", "content": "fix typo"}],
@@ -484,28 +617,12 @@ def test_no_fallback_after_partial_stream_output(tmp_path: Path):
     })
     assert status == 200  # headers already sent; error arrives as an SSE event
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert record["ok"] is False and "fallback" not in record
-
-
-def test_no_fallback_when_auth_is_dead(tmp_path: Path):
-    from model_router.errors import ReloginRequired
-
-    app = _flaky_fast(tmp_path, status=401)
-    fast = app.gateway._providers[app.config.fast.provider]
-    fast.refresh = lambda creds: (_ for _ in ()).throw(
-        ReloginRequired(app.config.fast.provider))
-    status, _headers, raw = _post(app, {
-        "model": "router-auto",
-        "messages": [{"role": "user", "content": "fix typo"}],
-    })
-    assert status == 401  # relogin_required, not a silent strong-tier switch
-    assert b"relogin_required" in raw
-    record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert "fallback" not in record
+    assert record["ok"] is False and record["attempts"] == []
 
 
 def test_chat_non_stream_and_request_log(tmp_path: Path):
     app = _app(tmp_path)
+    first = app.config.tiers["everyday"][0]
     status, _headers, raw = _post(app, {
         "model": "router-auto",
         "messages": [{"role": "user", "content": "Fix this typo in README.md"}],
@@ -515,13 +632,13 @@ def test_chat_non_stream_and_request_log(tmp_path: Path):
     assert data["object"] == "chat.completion"
     assert data["choices"][0]["message"]["content"] == "hello"
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert record["verdict"] == "trivial" and record["tier"] == "fast"
-    assert record["provider"] == "kimi" and record["ok"] is True
+    assert record["verdict"] == "trivial" and record["tier"] == "everyday"
+    assert record["provider"] == first.provider and record["ok"] is True
 
 
 def test_chat_stream_sse_shape(tmp_path: Path):
     status, headers, raw = _post(_app(tmp_path, text="hi"), {
-        "model": "router-strong",
+        "model": "router-high",
         "messages": [{"role": "user", "content": "anything"}],
         "stream": True,
     })
@@ -531,8 +648,9 @@ def test_chat_stream_sse_shape(tmp_path: Path):
     assert "chat.completion.chunk" in text and text.rstrip().endswith("data: [DONE]")
 
 
-def test_chat_hard_routes_strong(tmp_path: Path):
+def test_chat_hard_routes_very_high(tmp_path: Path):
     app = _app(tmp_path)
+    first = app.config.tiers["very_high"][0]
     status, _headers, _raw = _post(app, {
         "model": "router-auto",
         "messages": [{"role": "user",
@@ -540,7 +658,8 @@ def test_chat_hard_routes_strong(tmp_path: Path):
     })
     assert status == 200
     record = json.loads((tmp_path / "logs" / "requests.jsonl").read_text().strip())
-    assert record["verdict"] == "hard" and record["tier"] == "strong"
+    assert record["verdict"] == "hard" and record["tier"] == "very_high"
+    assert record["provider"] == first.provider
 
 
 def test_proxy_refuses_start_with_zero_auth(tmp_path: Path):
@@ -557,10 +676,11 @@ def test_strict_startup_refuses_partial_auth(tmp_path: Path):
 
     cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
     store = TokenStore(tmp_path / "store")
-    store.save(cfg.fast.provider, Credentials(access="a", refresh="r", expires=0))
+    store.save(cfg.tiers["everyday"][0].provider,
+               Credentials(access="a", refresh="r", expires=0))
     assert cfg.require_all_tiers is True
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
-    with pytest.raises(NoSubscriptionAuth, match=cfg.strong.provider):
+    with pytest.raises(NoSubscriptionAuth, match="moderate"):
         app.check_auth()
 
 
@@ -571,7 +691,7 @@ def test_strict_startup_refuses_unported_transport(tmp_path: Path):
     store.save("cursor", Credentials(access="a", refresh="r", expires=0))
     store.save("anthropic", Credentials(access="a", refresh="r", expires=0))
     cfg = RouterConfig()
-    cfg.fast.provider = "cursor"  # transport unported
+    cfg.tiers["everyday"] = [Tier("cursor", "m")]  # transport unported
     assert cfg.require_all_tiers is True
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
     with pytest.raises(NoSubscriptionAuth, match="cursor"):
@@ -608,13 +728,16 @@ def test_kimi_defaults_to_global_and_refresh_follows_stored_domain(monkeypatch):
 
 
 def test_strict_startup_all_ready(tmp_path: Path):
+    from model_router.config import TIERS
+
     cfg = RouterConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
     store = TokenStore(tmp_path / "store")
-    for tier in (cfg.fast, cfg.strong):
-        store.save(tier.provider, Credentials(access="a", refresh="r", expires=0))
+    for tier in TIERS:
+        for candidate in cfg.tiers[tier]:
+            store.save(candidate.provider, Credentials(access="a", refresh="r", expires=0))
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
     status = app.check_auth()
-    assert status["fast"]["ok"] and status["strong"]["ok"]
+    assert all(status[tier]["ok"] for tier in TIERS)
 
 
 def test_relaxed_startup_allows_partial(tmp_path: Path):
@@ -624,7 +747,8 @@ def test_relaxed_startup_allows_partial(tmp_path: Path):
     cfg.require_all_tiers = False
     app = ProxyApp(cfg, store=store, log_dir=tmp_path / "logs")
     status = app.check_auth()  # must not raise
-    assert status["fast"]["ok"] and not status["strong"]["ok"]
+    assert status["everyday"]["ok"] and status["moderate"]["ok"]
+    assert not status["very_high"]["ok"]  # needs anthropic/windsurf/openai/muse
 
 
 def test_tier_status_marks_unported_transport(tmp_path: Path):
@@ -632,11 +756,34 @@ def test_tier_status_marks_unported_transport(tmp_path: Path):
     store.save("cursor", Credentials(access="a", refresh="r", expires=0))
     cfg = RouterConfig()
     gateway = Gateway(cfg, store)
-    # point fast at cursor (unported transport) -> disabled with reason
-    cfg.fast.provider = "cursor"
+    # point everyday at cursor (unported transport) -> disabled with reason
+    cfg.tiers["everyday"] = [Tier("cursor", "m")]
     status = gateway.tier_status()
-    assert status["fast"]["auth"] is True and status["fast"]["ok"] is False
-    assert "unavailable" in status["fast"]["transport"]
+    candidate = status["everyday"]["candidates"][0]
+    assert candidate["auth"] is True and candidate["ok"] is False
+    assert status["everyday"]["ok"] is False
+    assert "unavailable" in candidate["transport"]
+
+
+def test_legacy_fast_strong_config_rejected(tmp_path: Path):
+    legacy = tmp_path / "config.yaml"
+    legacy.write_text("tiers:\n  fast: {provider: kimi, model: m}\n"
+                      "  strong: {provider: xai, model: m}\n")
+    with pytest.raises(ValueError, match="everyday/moderate/high/very_high"):
+        RouterConfig.load(legacy)
+
+
+def test_cooldown_configurable(tmp_path: Path):
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "tiers:\n"
+        "  everyday: [{provider: kimi, model: m}]\n"
+        "  moderate: [{provider: kimi, model: m}]\n"
+        "  high: [{provider: kimi, model: m}]\n"
+        "  very_high: [{provider: kimi, model: m}]\n"
+        "policy:\n  cooldown_seconds: 60\n")
+    assert RouterConfig.load(cfg_file).cooldown_seconds == 60
+    assert RouterConfig().cooldown_seconds == 300
 
 
 def test_responses_payload_translation():
@@ -920,7 +1067,7 @@ def test_proxy_preserves_tool_calls(tmp_path: Path):
     app = _app(tmp_path)
     provider = app.gateway._providers["kimi"]
     provider.open_chat = lambda *_args: ToolTransport()
-    body = {"model": "router-fast", "messages": [{"role": "user", "content": "read a file"}]}
+    body = {"model": "router-moderate", "messages": [{"role": "user", "content": "read a file"}]}
     status, _, raw = _post(app, body)
     assert status == 200
     choice = json.loads(raw)["choices"][0]

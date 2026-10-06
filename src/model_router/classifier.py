@@ -1,8 +1,8 @@
 """Difficulty classifier: subscription model first, heuristic fallback.
 
 Model prompt: "Rate this coding task's difficulty as exactly one word:
-trivial, easy, or hard." Task truncated to ~2k chars. Every classification is
-logged (timestamp, verdict, latency, source).
+trivial, easy, medium, or hard." Task truncated to ~2k chars. Every
+classification is logged (timestamp, verdict, latency, source).
 """
 
 from __future__ import annotations
@@ -13,14 +13,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 PROMPT = ("Rate this coding task's difficulty as exactly one word: "
-          "trivial, easy, or hard.")
+          "trivial, easy, medium, or hard.")
 TASK_LIMIT = 2000
 
 _TRIVIAL = ("typo", "rename", "fix comment", "format", "whitespace", "spelling")
+_MEDIUM = ("bug", "debug", "failing test", "implement", "integrat", "optimiz",
+           "database", "auth", "endpoint", "feature", "upgrade", "deprecat")
 _HARD = ("design", "refactor", "architect", "race condition", "deadlock",
          "distributed", "migration", "security", "concurrency", "performance regression")
 
-_VERDICTS = ("trivial", "easy", "hard")
+_VERDICTS = ("trivial", "easy", "medium", "hard")
 
 
 @dataclass
@@ -36,13 +38,15 @@ def heuristic_classify(text: str) -> str:
         return "hard"
     if any(keyword in lowered for keyword in _TRIVIAL):
         return "trivial"
+    if any(keyword in lowered for keyword in _MEDIUM):
+        return "medium"
     if len(text) > 4000:
         return "hard"
     return "easy"
 
 
 def parse_verdict(raw: str) -> str | None:
-    match = re.search(r"\b(trivial|easy|hard)\b", raw.strip().lower())
+    match = re.search(r"\b(trivial|easy|medium|hard)\b", raw.strip().lower())
     return match.group(1) if match else None
 
 

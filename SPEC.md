@@ -30,11 +30,13 @@ opencode (or any OpenAI-compatible coding agent)
 │ 1. Difficulty classifier                             │
 │    - small fast model via subscription, or           │
 │      lightweight heuristic fallback                  │
-│    - outputs one of: trivial | easy | hard           │
+│    - outputs one of: trivial | easy | medium | hard  │
 │ 2. Routing policy                                    │
-│    - trivial/easy → fast tier model                  │
-│    - hard         → strong tier model                │
-│    - on failure   → escalate one tier and retry      │
+│    - trivial → everyday, easy → moderate,            │
+│      medium → high, hard → very_high                 │
+│    - each tier is an ordered pool of provider/model  │
+│      candidates (same quality, different wallets);  │
+│      on failure try the next wallet, then climb      │
 │ 3. Subscription auth layer                           │
 │    - OAuth tokens only (Cursor, xAI/Grok)            │
 │    - auto-refresh; clear "re-login required" errors  │
@@ -64,33 +66,48 @@ Cursor subscription gateway / xAI subscription gateway
 ### 2. Difficulty classifier
 - Default: ask a small fast model (via subscription) with a tiny prompt such
   as: `Rate this coding task's difficulty as exactly one word: trivial, easy,
-  or hard.` Keep it cheap — truncate the task to the first ~2k characters.
+  medium, or hard.` Keep it cheap — truncate the task to the first ~2k characters.
 - Fallback heuristic when the classifier is unreachable: keyword/length rules
-  (e.g. "typo", "rename" → trivial; "design", "refactor", "architecture",
-  "race condition" → hard; default → easy).
+  (e.g. "typo", "rename" → trivial; "bug", "implement" → medium; "design",
+  "refactor", "architecture", "race condition" → hard; default → easy).
 - Log every classification (timestamp, verdict, latency) for later tuning.
 
 ### 3. Routing policy (`config.yaml`)
 ```yaml
 tiers:
-  fast:   { provider: cursor, model: "<fast model id>" }
-  strong:  { provider: xai,    model: "grok-4.5" }
+  everyday:  [{ provider: zai,  model: "glm-5.3-flash" },
+              { provider: kimi, model: "kimi-for-coding-highspeed" }]
+  moderate:  [{ provider: kimi, model: "kimi-for-coding" }]
+  high:      [{ provider: zai,  model: "glm-5.3" },
+              { provider: kimi, model: "k3" },
+              { provider: muse, model: "muse-spark-1.3" }]
+  very_high: [{ provider: anthropic, model: "claude-fable-5-1" },
+              { provider: windsurf,  model: "claude-fable-5-1" },
+              { provider: openai,    model: "gpt-6-astra" }]
 policy:
   default_mode: auto
-  # modes: auto | fast-only | strong-only | weak-first-escalate
+  cooldown_seconds: 300
+  # modes: auto | everyday-only | moderate-only | high-only | very-high-only
+  #        | weak-first-escalate
 ```
 - `auto`: classify each request, route by verdict.
-- `weak-first-escalate`: try the fast tier first; if the agent trajectory
-  shows failure/retry loops (configurable: N consecutive tool errors or an
-  explicit "this isn't working" signal), escalate the session to the strong
-  tier mid-task. (Same pattern as Switchyard's `auto-esc`.)
+- Within a tier, list order is wallet preference: the first logged-in,
+  non-cooling candidate serves. A 429/quota refusal cools that wallet for
+  `cooldown_seconds` (rotation skips it); a dead grant skips the wallet
+  outright. Only then does the request climb one rung.
+- `weak-first-escalate`: route normally, then climb one rung when the agent
+  trajectory shows failure/retry loops (configurable: N consecutive tool
+  errors or an explicit "this isn't working" signal). (Same pattern as
+  Switchyard's `auto-esc`.)
 - Manual override without restarting: virtual model aliases
-  `router-auto`, `router-fast`, `router-strong` selectable in the agent's
-  model picker, plus an `X-Router-Mode` request header.
+  `router-auto`, `router-everyday`, `router-moderate`, `router-high`,
+  `router-very-high` selectable in the agent's model picker, plus an
+  `X-Router-Mode` request header.
 
 ### 4. Proxy server
 - OpenAI-compatible endpoints:
-  - `GET /v1/models` → lists `router-auto`, `router-fast`, `router-strong`
+  - `GET /v1/models` → lists `router-auto` plus the per-tier pins
+    (`router-everyday`, `router-moderate`, `router-high`, `router-very-high`)
   - `POST /v1/chat/completions` → classify → route → proxy (SSE streaming)
 - Translates between the OpenAI chat format and each provider's subscription
   gateway format as needed.
@@ -104,15 +121,17 @@ policy:
 - **Routing ideas**: NeMo Switchyard bundle (classifier + escalation pattern).
 
 ## Acceptance criteria
-1. `curl 127.0.0.1:PORT/v1/models` lists the three virtual router models with
+1. `curl 127.0.0.1:PORT/v1/models` lists the five virtual router models with
    no API key configured anywhere on the machine.
-2. `"Fix this typo in README.md"` routes to the fast tier; `"Design a plugin
-   architecture for a multi-tenant billing system"` routes to the strong
+2. `"Fix this typo in README.md"` routes to the everyday tier; `"Design a plugin
+   architecture for a multi-tenant billing system"` routes to the very_high
    tier (verify in the request log).
-3. Works with only the Cursor subscription logged in; xAI is optional and the
-   proxy still starts (strong tier disabled with a clear log line).
-4. In `weak-first-escalate` mode, a failing fast-tier attempt escalates to the
-   strong tier.
+3. Works with only a subset of subscriptions logged in; tiers without a ready
+   wallet are reported per-candidate, and strict startup refuses until every
+   tier has at least one (or `policy.require_all_tiers: false` allows
+   degraded starts).
+4. In `weak-first-escalate` mode, a failing attempt climbs one rung; a 429 on
+   one wallet rotates to the next wallet in the same tier.
 5. `grep -ri "api[_-]key" ~/.config/model-router` returns nothing; no key
    material exists on disk.
 

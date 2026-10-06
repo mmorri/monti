@@ -2,10 +2,13 @@
 
 **A difficulty-based model router for coding agents, powered only by the
 subscriptions you already pay for.** Every request is classified (trivial /
-easy / hard), routed to a fast or strong tier, and served through your
-existing Kimi, Anthropic, Meta Muse, Windsurf, OpenAI, or Z.ai subscription —
-with OAuth login only. **No API keys anywhere**: not stored, not accepted,
-not even as a fallback. Fail closed, always.
+easy / medium / hard) and routed to one of four tiers — everyday, moderate,
+high, very_high — each an ordered pool of interchangeable candidates across
+your Kimi, Anthropic, Meta Muse, Windsurf, OpenAI, and Z.ai subscriptions.
+Same model on two subscriptions? List it twice: the router burns the wallet
+you prefer and rotates when one cools down. OAuth login only.
+**No API keys anywhere**: not stored, not accepted, not even as a fallback.
+Fail closed, always.
 
 Monti is a standalone local service, not a plugin or a fork. It works with
 [opencode](https://opencode.ai) (first-class, via a 10-line config) and any
@@ -15,11 +18,16 @@ quick tasks.
 ## What it does
 
 - **Classifies** each request's difficulty (model-based classifier with a
-  heuristic fallback) and routes: trivial/easy → fast tier, hard → strong tier.
-- **Fails over** automatically: a transient fast-tier failure (429/5xx/network)
-  escalates once to the strong tier before any error reaches you.
-- **Escalates sessions** (`weak-first-escalate`): start cheap, upgrade to the
-  strong tier after repeated tool errors or an explicit "this isn't working".
+  heuristic fallback) and routes: trivial → everyday, easy → moderate,
+  medium → high, hard → very_high.
+- **Rotates wallets**: each tier is a pool of provider/model candidates in
+  your preference order. A 429/quota refusal cools that wallet down for
+  `cooldown_seconds` (default 300s) and the next wallet serves — same
+  quality band, different subscription. Only then does the request climb
+  to the next rung up. A dead grant (`RELOGIN_REQUIRED`) skips the whole
+  wallet, never fails the tier.
+- **Escalates sessions** (`weak-first-escalate`): start at the routed tier,
+  climb one rung after repeated tool errors or an explicit "this isn't working".
 - **Lists live model catalogs** per logged-in subscription, so pinning a model
   never means guessing IDs.
 - **Keeps tokens safe**: `~/.config/model-router/<provider>/auth.json`,
@@ -54,7 +62,7 @@ Requires **Python 3.11+** on **macOS or Linux**.
 uv tool install git+https://github.com/mmorri/monti   # or: pipx install git+https://github.com/mmorri/monti
 monti login kimi      # or anthropic / muse / windsurf / openai / zai
 monti models          # live catalogs from every logged-in subscription
-monti --mode fast "explain this project"
+monti --mode moderate "explain this project"
 monti                 # interactive session (/help for commands)
 ```
 
@@ -82,7 +90,7 @@ monti serve                                         # uses it anywhere
 
 Tiers pin one model each; `monti models` lists every logged-in provider's
 live catalog so you never guess a model ID. Without any config file Monti
-defaults to `fast: kimi/kimi-for-coding`, `strong: anthropic/claude-sonnet-4-5`.
+uses built-in defaults (kimi fast lanes, muse high, anthropic top).
 
 ## Use with opencode
 
@@ -97,9 +105,11 @@ monti serve          # or: model-router serve --config <path>
       "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://127.0.0.1:8787/v1" },
       "models": {
-        "router-auto":   { "name": "Router · auto" },
-        "router-fast":   { "name": "Router · fast" },
-        "router-strong": { "name": "Router · strong" }
+        "router-auto":      { "name": "Router · auto" },
+        "router-everyday":  { "name": "Router · everyday" },
+        "router-moderate":  { "name": "Router · moderate" },
+        "router-high":      { "name": "Router · high" },
+        "router-very-high": { "name": "Router · very high" }
       }
     }
   }
@@ -107,16 +117,17 @@ monti serve          # or: model-router serve --config <path>
 ```
 
 Pick a router model in opencode's model picker, or send an
-`X-Router-Mode: auto|fast-only|strong-only|weak-first-escalate` header from
-any client.
+`X-Router-Mode: auto|everyday-only|moderate-only|high-only|very-high-only|weak-first-escalate`
+header from any client.
 
 ## Modes
 
-- `auto` (default): classify each request; hard goes strong.
-- `fast-only` / `strong-only`: pin the tier.
-- `weak-first-escalate`: start fast; escalate the session after N consecutive
-  tool errors or an explicit signal ("this isn't working", …). Sessions are
-  tracked via the `X-Router-Session` header.
+- `auto` (default): classify each request; trivial→everyday, easy→moderate,
+  medium→high, hard→very_high.
+- `everyday-only` / `moderate-only` / `high-only` / `very-high-only`: pin the tier.
+- `weak-first-escalate`: start at the routed tier; climb one rung after N
+  consecutive tool errors or an explicit signal ("this isn't working", …).
+  Sessions are tracked via the `X-Router-Session` header.
 
 ## Security model
 
