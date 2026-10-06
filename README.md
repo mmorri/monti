@@ -61,11 +61,16 @@ Requires **Python 3.11+** on **macOS or Linux**.
 
 ```sh
 uv tool install git+https://github.com/mmorri/monti   # or: pipx install git+https://github.com/mmorri/monti
-monti login kimi      # or anthropic / muse / windsurf / openai / zai
-monti models          # live catalogs from every logged-in subscription
-monti --mode moderate "explain this project"
+monti setup           # connect subscriptions → auto-picks models → saves config
+monti models          # live catalogs + pool status
 monti                 # interactive session (/help for commands)
 ```
+
+`monti setup` walks you through each provider login (skip what you don't
+have), probes the live catalog of everything connected, and builds the
+tier pools + free-first classifier from what actually exists on your
+accounts — saving to `~/.config/model-router/config.yaml`, fully
+hand-editable afterwards.
 
 **From a checkout** (for development):
 

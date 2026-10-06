@@ -205,6 +205,16 @@ def cmd_chat(args) -> int:
         return 1
 
 
+def cmd_setup(args) -> int:
+    from .onboarding import run_setup
+
+    try:
+        return run_setup(_store(), output=Path(args.out) if args.out else None)
+    except (RouterError, HttpStatusError, OSError, ValueError) as exc:
+        print(f"setup failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="monti",
                                      description="Terminal coding assistant with subscription model routing",
@@ -228,6 +238,9 @@ def build_parser() -> argparse.ArgumentParser:
     models = sub.add_parser("models", help="show configured models and availability")
     models.add_argument("--config")
     models.set_defaults(func=cmd_models)
+    setup = sub.add_parser("setup", help="connect subscriptions, auto-pick models, save config")
+    setup.add_argument("--out", default=None, help="write config here instead of the user config")
+    setup.set_defaults(func=cmd_setup)
     chat = sub.add_parser("chat", help="interactive session or one-shot coding task")
     chat.add_argument("prompt", nargs="*", help="task; omit for an interactive session")
     chat.add_argument("--config", help="path to config.yaml")
@@ -246,7 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"login", "logout", "status", "serve", "models", "chat"}
+    commands = {"login", "logout", "status", "serve", "models", "chat", "setup"}
     if not argv or (argv[0] not in commands and argv[0] not in ("-h", "--help")):
         argv.insert(0, "chat")
     args = build_parser().parse_args(argv)

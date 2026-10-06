@@ -840,6 +840,92 @@ def test_classifier_parsing_and_wallet_order(tmp_path: Path):
     assert usable == [("kimi", "kimi-for-coding-highspeed")]
 
 
+def test_setup_builds_pools_from_logins_and_catalogs():
+    import yaml
+
+    from model_router.config import RouterConfig
+    from model_router.onboarding import build_config_dict
+
+    logged_in = {"anthropic", "kimi", "muse", "zai"}
+    catalogs = {
+        "anthropic": ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5",
+                      "claude-haiku-4-5-20251001"],
+        "kimi": ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"],
+        "muse": ["muse-spark-1.3", "muse-spark-1.3-contributor"],
+        "zai": ["glm-5.3", "glm-5.3-flash"],
+    }
+    config, notes = build_config_dict(logged_in, catalogs)
+    # Every pool entry belongs to a logged-in provider and its catalog
+    # (dated snapshot prefixes count: claude-haiku-4-5).
+    assert [e["model"] for e in config["tiers"]["everyday"]] == [
+        "glm-5.3-flash", "kimi-for-coding-highspeed"]
+    assert config["tiers"]["moderate"][-1] == {"provider": "anthropic",
+                                               "model": "claude-haiku-4-5"}
+    assert [e["provider"] for e in config["tiers"]["very_high"]] == ["anthropic",
+                                                                     "anthropic", "muse"]
+    assert [e["model"] for e in config["classifier"]] == [
+        "muse-spark-1.3-contributor", "glm-5.3-flash", "kimi-for-coding-highspeed"]
+    assert config["policy"]["require_all_tiers"] is True
+    # Round-trips through RouterConfig.load.
+    written = tmp_yaml(config)
+    loaded = RouterConfig.load(written)
+    assert [(t.provider, t.model) for t in loaded.tiers["high"]] == [
+        ("zai", "glm-5.3"), ("anthropic", "claude-sonnet-5-5"),
+        ("kimi", "k3"), ("muse", "muse-spark-1.3")]
+
+    # A subscription missing (windsurf, openai logged out) drops its entries;
+    # missing catalog entries are skipped with a note.
+    logged_in2 = {"kimi", "windsurf", "openai"}
+    catalogs2 = {"kimi": ["kimi-for-coding"], "windsurf": ["gpt-5-5-medium"],
+                 "openai": None}
+    config2, notes2 = build_config_dict(logged_in2, catalogs2)
+    assert config2["tiers"]["moderate"] == [
+        {"provider": "kimi", "model": "kimi-for-coding"},
+        {"provider": "windsurf", "model": "gpt-5-5-medium"}]
+    assert any("kimi-for-coding-highspeed" in n for n in notes2)
+    # Empty tiers force relaxed startup.
+    assert config2["policy"]["require_all_tiers"] is False
+    assert any("require_all_tiers" in n for n in notes2)
+
+
+def tmp_yaml(config: dict):
+    import tempfile
+
+    import yaml
+
+    path = Path(tempfile.mkstemp(suffix=".yaml")[1])
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+    return path
+
+
+def test_setup_command_end_to_end(tmp_path, monkeypatch):
+    from model_router.onboarding import run_setup
+    from model_router.store import TokenStore, Credentials
+
+    store = TokenStore(tmp_path / "tokens")
+    store.save("kimi", Credentials(access="a"))
+    store.save("muse", Credentials(access="a"))
+    store.save("zai", Credentials(access="a"))
+    # Decline every new login, decline "more", then it probes + writes.
+    answers = iter(["n"] * 12)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    def fake_probe(_store, logged_in):
+        return {"kimi": ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"],
+                "muse": ["muse-spark-1.3", "muse-spark-1.3-contributor"],
+                "zai": ["glm-5.3", "glm-5.3-flash"]}
+
+    import model_router.onboarding as ob
+    monkeypatch.setattr(ob, "probe_catalogs", fake_probe)
+    out = tmp_path / "config.yaml"
+    assert run_setup(store, output=out, print_fn=lambda *_a: None) == 0
+    text = out.read_text()
+    assert "glm-5.3-flash" in text and "muse-spark-1.3-contributor" in text
+    # Second run backs up the previous config instead of clobbering.
+    assert run_setup(store, output=out, print_fn=lambda *_a: None) == 0
+    assert list(out.parent.glob("config.yaml.bak-*")), "backup not written"
+
+
 def test_repo_config_pools_reference_known_providers():
     from model_router.providers import REGISTRY
 
