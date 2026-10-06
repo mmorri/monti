@@ -2,7 +2,9 @@ tiers:
   # Pin one model per tier; `monti models` lists each logged-in provider's
   # live catalog, /model strong anthropic/<model> switches mid-session.
   fast:   { provider: kimi,       model: "kimi-for-coding" }
-  strong: { provider: anthropic,  model: "claude-sonnet-4-5" }
+  # Muse as strong until `monti login anthropic`; then switch to
+  # anthropic/claude-sonnet-4-5 (or whatever `monti models` lists).
+  strong: { provider: muse,       model: "muse-spark-1.3" }
 policy:
   default_mode: auto
   # modes: auto | fast-only | strong-only | weak-first-escalate
