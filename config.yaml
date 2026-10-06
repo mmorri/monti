@@ -1,0 +1,25 @@
+tiers:
+  # Pin one model per tier; `monti models` lists each logged-in provider's
+  # live catalog, /model strong anthropic/<model> switches mid-session.
+  fast:   { provider: kimi,       model: "kimi-latest" }
+  strong: { provider: anthropic,  model: "claude-sonnet-4-5" }
+policy:
+  default_mode: auto
+  # modes: auto | fast-only | strong-only | weak-first-escalate
+  # Strict startup: refuse unless every tier is logged in + transport-ready.
+  require_all_tiers: true
+  escalation:
+    tool_error_threshold: 3
+    signals:
+      - "this isn't working"
+      - "this is not working"
+      - "try a different approach"
+      - "that didn't work"
+      - "still failing"
+      - "still broken"
+# Optional per-provider overrides (host URLs only — never keys):
+# providers:
+#   kimi: { oauth_host: "https://auth.kimi.com" }
+#   xai:  { gateway_base_url: "https://cli-chat-proxy.grok.com/v1" }
+port: 8787
+log_dir: "~/.config/model-router/logs"
