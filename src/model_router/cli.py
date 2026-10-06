@@ -15,6 +15,21 @@ from .store import TokenStore
 DEFAULT_CONFIG = Path("config.yaml")
 
 
+def _user_config() -> Path:
+    return Path.home() / ".config" / "model-router" / "config.yaml"
+
+
+def _config_path(explicit: str | None) -> Path | None:
+    """Explicit path wins; then ./config.yaml; then the user config."""
+    if explicit:
+        return Path(explicit)
+    if DEFAULT_CONFIG.exists():
+        return DEFAULT_CONFIG.resolve()
+    if _user_config().exists():
+        return _user_config()
+    return None
+
+
 def _store() -> TokenStore:
     return TokenStore()
 
@@ -59,10 +74,8 @@ def cmd_status(_args) -> int:
 def cmd_serve(args) -> int:
     from .proxy import ProxyApp, serve
 
-    config_path = Path(args.config) if args.config else (
-        DEFAULT_CONFIG if DEFAULT_CONFIG.exists() else None)
     try:
-        config = RouterConfig.load(config_path)
+        config = load_config(args.config)
     except (ValueError, OSError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 1
@@ -84,8 +97,7 @@ def cmd_serve(args) -> int:
 
 
 def load_config(path: str | None) -> RouterConfig:
-    return RouterConfig.load(Path(path) if path else (
-        DEFAULT_CONFIG if DEFAULT_CONFIG.exists() else None))
+    return RouterConfig.load(_config_path(path))
 
 
 def _print_catalog(gateway, store, provider_id: str, indent: str = "  ") -> None:

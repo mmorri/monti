@@ -46,20 +46,48 @@ OAuth flow (currently Z.ai) accept the plan key interactively via
 
 ## Quickstart
 
-```sh
-git clone <this-repo> && cd monti
-uv venv && uv pip install -e .
+Requires **Python 3.11+** on **macOS or Linux**.
 
+**As a CLI tool** (recommended — no clone, no activation):
+
+```sh
+uv tool install git+https://github.com/mmorri/monti   # or: pipx install git+https://github.com/mmorri/monti
 monti login kimi      # or anthropic / muse / windsurf / openai / zai
 monti models          # live catalogs from every logged-in subscription
 monti --mode fast "explain this project"
 monti                 # interactive session (/help for commands)
 ```
 
+**From a checkout** (for development):
+
+```sh
+git clone https://github.com/mmorri/monti && cd monti
+uv venv && uv pip install -e .      # or: python3 -m venv .venv && .venv/bin/pip install -e .
+source .venv/bin/activate           # <- without this, `monti` is not on PATH
+monti login kimi
+```
+
+## Configuration
+
+Monti looks for `config.yaml` in the **current directory first**, then in
+`~/.config/model-router/config.yaml` — so a one-time setup works from any
+directory:
+
+```sh
+mkdir -p ~/.config/model-router
+cp config.yaml ~/.config/model-router/config.yaml   # from a checkout
+$EDITOR ~/.config/model-router/config.yaml          # pin your tiers
+monti serve                                         # uses it anywhere
+```
+
+Tiers pin one model each; `monti models` lists every logged-in provider's
+live catalog so you never guess a model ID. Without any config file Monti
+defaults to `fast: kimi/kimi-for-coding`, `strong: anthropic/claude-sonnet-4-5`.
+
 ## Use with opencode
 
 ```sh
-model-router serve --config config.yaml
+monti serve          # or: model-router serve --config <path>
 ```
 
 ```json

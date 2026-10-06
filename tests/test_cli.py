@@ -233,6 +233,25 @@ def test_weak_first_starts_fast_and_does_not_recount_history():
         assert router.route(messages, '', 'weak-first-escalate', 's')[0].tier == 'fast'
 
 
+def test_config_discovery_cwd_then_home(monkeypatch, tmp_path):
+    from model_router import cli
+
+    empty_cwd = tmp_path / "cwd"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / ".config" / "model-router").mkdir(parents=True)
+    user_cfg = tmp_path / "home" / ".config" / "model-router" / "config.yaml"
+    user_cfg.write_text("tiers:\n  fast: {provider: muse, model: m}\n")
+    assert cli._config_path(None) == user_cfg
+    # ./config.yaml in cwd wins over the user config
+    (empty_cwd / "config.yaml").write_text("port: 9999\n")
+    assert cli._config_path(None) == empty_cwd / "config.yaml"
+    assert cli.load_config(None).port == 9999
+    # explicit beats both
+    assert cli._config_path(str(user_cfg)) == user_cfg
+
+
 def test_interactive_commands_and_error_recovery(tmp_path):
     prompts = iter(['/mode strong', 'hello', '/clear', '/exit'])
     agent, _, _ = agent_with(tmp_path, [[HttpStatusError('POST', 'https://x.invalid', 500)]],
