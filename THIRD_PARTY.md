@@ -51,6 +51,17 @@ carried over (this router accepts none).
   catalog. Generic protobuf/Connect primitives live in
   `src/model_router/proto_wire.py` for reuse by future ports (e.g. Cursor).
 
+## cursor/sdk-bridge (evaluated, not ported)
+
+- `cursor/sdk-bridge` (MIT) is the official `sdk.v1` contract: a local
+  Connect/HTTP-1.1+JSON bridge embedding `@cursor/sdk`, driving full Cursor
+  *agents* (spawn → send → stream run) with a dashboard API key. Evaluated as
+  a chat transport and rejected: agents execute their own tools (the OpenAI
+  tool-calling contract the proxy speaks cannot be honored, and monti's
+  approval gates would be bypassed), and the key is a dashboard credential,
+  not the PKCE subscription token. Documented in docs/TRANSPORTS.md; becomes
+  attractive the day a model-level chat RPC appears on the bridge.
+
 ## Z.ai plan-key exception
 
 - No third-party code involved: the GLM Coding Plan key is supplied by the
