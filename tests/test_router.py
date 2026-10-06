@@ -69,11 +69,34 @@ def test_cursor_credentials_identity_and_skew():
 
 # -- anthropic / copilot url shapes ------------------------------------------
 def test_anthropic_auth_url_params():
-    url = anthropic_url("CH", "ST", "http://127.0.0.1:54545/callback")
+    url = anthropic_url("CH", "ST", "http://localhost:54545/callback")
     assert url.startswith("https://claude.ai/oauth/authorize?")
     for needle in ("code_challenge=CH", "code_challenge_method=S256", "state=ST",
-                   "client_id=9d1c250a", "response_type=code"):
+                   "client_id=9d1c250a", "response_type=code",
+                   "redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback",
+                   "user%3Asessions%3Aclaude_code"):
         assert needle in url
+
+
+def test_anthropic_login_uses_localhost_callback_and_platform_token_url(monkeypatch):
+    from model_router.providers import anthropic as ap
+
+    assert ap.TOKEN_URL == "https://platform.claude.com/v1/oauth/token"
+    seen = {}
+
+    def fake_flow(*, port, path, build_auth_url, open_browser=True, **kwargs):
+        url, _instructions = build_auth_url("ST", f"http://localhost:{port}{path}")
+        seen.update(url=url, extra=kwargs)
+        return None, f"http://localhost:{port}{path}"
+
+    monkeypatch.setattr(ap, "run_callback_flow", fake_flow)
+    monkeypatch.setattr(ap, "prompt_manual_code", lambda _provider: "CODE")
+    monkeypatch.setattr(ap, "_post_token", lambda _fields: {
+        "access_token": "a", "refresh_token": "r", "expires_in": 3600,
+        "account": {"uuid": "u", "email_address": "A@B.c"}})
+    creds = ap.AnthropicProvider().login()
+    assert seen["extra"].get("redirect_host") == "localhost"
+    assert creds.access == "a" and creds.email == "a@b.c"
 
 
 def test_anthropic_messages_translation():

@@ -2,9 +2,12 @@
 
 Port of opencodex src/oauth/anthropic.ts (MIT, see THIRD_PARTY.md):
 authorize https://claude.ai/oauth/authorize,
-token https://api.anthropic.com/v1/oauth/token,
-callback port 54545 /callback,
-scope "org:create_api_key user:profile user:inference".
+token https://platform.claude.com/v1/oauth/token (Claude Code 2.1.220+ posts
+the code exchange there, not api.anthropic.com),
+callback http://localhost:54545/callback (registration rejects 127.0.0.1),
+scope "user:profile user:inference user:sessions:claude_code
+user:mcp_servers user:file_upload". Tracked against CLIProxyAPI
+internal/auth/claude (MIT).
 
 Chat transport: Anthropic Messages API (public documented API) with the OAuth
 beta headers the opencodex adapter applies for authMode == "oauth".
@@ -26,10 +29,12 @@ from .base import ChatChunk, ChatRequest, ChatTransport, Provider
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AUTH_URL = "https://claude.ai/oauth/authorize"
-TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CALLBACK_PORT = 54545
 CALLBACK_PATH = "/callback"
-SCOPES = "org:create_api_key user:profile user:inference"
+CALLBACK_HOST = "localhost"  # registration rejects http://127.0.0.1:...
+SCOPES = ("user:profile user:inference user:sessions:claude_code "
+          "user:mcp_servers user:file_upload")
 EXPIRY_SKEW_MS = 5 * 60 * 1000
 
 OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20"
@@ -94,6 +99,7 @@ class AnthropicProvider(Provider):
         result, redirect_uri = run_callback_flow(
             port=CALLBACK_PORT, path=CALLBACK_PATH, build_auth_url=build,
             open_browser=kwargs.get("open_browser", True),
+            redirect_host=CALLBACK_HOST,
         )
         if result:
             code, state = result.code, result.state
@@ -101,13 +107,15 @@ class AnthropicProvider(Provider):
             pasted = prompt_manual_code(self.id)
             code, _, frag = pasted.partition("#")
             state = frag or ""
+        # Field order mirrors Claude Code's wire body (grant_type, code,
+        # redirect_uri, client_id, code_verifier, state).
         payload = _post_token({
             "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
             "code": code,
-            "state": state,
             "redirect_uri": redirect_uri,
+            "client_id": CLIENT_ID,
             "code_verifier": pkce.verifier,
+            "state": state,
         })
         return credentials_from_payload(payload)
 
@@ -116,9 +124,10 @@ class AnthropicProvider(Provider):
             raise ReloginRequired(self.id)
         try:
             payload = _post_token({
-                "grant_type": "refresh_token",
                 "client_id": CLIENT_ID,
+                "grant_type": "refresh_token",
                 "refresh_token": creds.refresh,
+                "scope": SCOPES,
             })
         except AuthFlowError as exc:
             raise ReloginRequired(self.id) from exc

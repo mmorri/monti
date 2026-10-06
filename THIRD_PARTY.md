@@ -25,7 +25,7 @@ carried over (this router accepts none).
   follows opencodex; if refresh fails with HTTP 404, the `/auth/refresh`
   variant is the documented fallback to try.
 
-## CLIProxyAPI (OAuth port: muse/meta)
+## CLIProxyAPI (OAuth ports: muse/meta; live cross-check: anthropic)
 
 - Source ported: `router-for-me/CLIProxyAPI` (main), `internal/auth/meta/meta.go`
   (MIT, (c) router-for-me/CLIProxyAPI contributors).
@@ -35,6 +35,12 @@ carried over (this router accepts none).
   user-managed platform key. The Responses translation for the `openai`
   provider follows the same gateway wire that project's codex executor
   speaks.
+- Live cross-check that corrected this router's Anthropic port (2026-10-06):
+  `internal/auth/claude/anthropic_auth.go` shows Claude Code 2.1.220+ posts
+  the code exchange to `platform.claude.com/v1/oauth/token` (not
+  `api.anthropic.com`), registers the callback as `http://localhost:54545`
+  (the `127.0.0.1` form is rejected), and uses the
+  `user:...:claude_code` scope family. This router follows all three.
 
 ## opencode-windsurf-auth (OAuth + chat port: windsurf)
 

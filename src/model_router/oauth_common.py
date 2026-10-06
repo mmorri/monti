@@ -65,6 +65,8 @@ def run_callback_flow(
     timeout: float = 300.0,
     open_browser: bool = True,
     token_params: tuple[str, ...] = ("code",),
+    bind_host: str = "127.0.0.1",
+    redirect_host: str | None = None,
 ) -> tuple[CallbackResult | None, str]:
     """Run one PKCE browser round-trip.
 
@@ -72,9 +74,14 @@ def run_callback_flow(
     token_params names the query parameter(s) carrying the credential
     ("code" for authorization-code flows; Windsurf's implicit flow uses
     firebase_id_token/access_token instead).
+    bind_host is the local interface to listen on; redirect_host overrides
+    the hostname placed in redirect_uri when the provider's client
+    registration distinguishes it (Anthropic only allows `localhost`, not
+    `127.0.0.1`). Binding 127.0.0.1 still receives localhost connections.
     Returns (result_or_None, redirect_uri). None means manual paste is needed.
     """
-    redirect_uri = f"http://127.0.0.1:{port}{path}"
+    shown_host = redirect_host or bind_host
+    redirect_uri = f"http://{shown_host}:{port}{path}"
     state = secrets.token_urlsafe(24)
     url, instructions = build_auth_url(state, redirect_uri)
     print(f"\n{instructions}")
@@ -86,7 +93,7 @@ def run_callback_flow(
             pass
     box: dict = {}
     try:
-        server = HTTPServer(("127.0.0.1", port),
+        server = HTTPServer((bind_host, port),
                             _handler_for(path, state, box, token_params))
     except OSError:
         print("Could not bind the localhost callback listener; use manual paste.")

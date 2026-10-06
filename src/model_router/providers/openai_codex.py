@@ -32,6 +32,7 @@ TOKEN_URL = "https://auth.openai.com/oauth/token"
 SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke"
 CALLBACK_PORT = 1455
 CALLBACK_PATH = "/auth/callback"
+CALLBACK_HOST = "localhost"  # docstring flow uses localhost, not 127.0.0.1
 ORIGINATOR = "model-router"
 EXPIRY_SKEW_MS = 5 * 60 * 1000
 GATEWAY_BASE_URL = "https://chatgpt.com/backend-api"
@@ -112,6 +113,7 @@ class OpenAIProvider(Provider):
         result, redirect_uri = run_callback_flow(
             port=CALLBACK_PORT, path=CALLBACK_PATH, build_auth_url=build,
             open_browser=kwargs.get("open_browser", True),
+            redirect_host=CALLBACK_HOST,
         )
         code = result.code if result else prompt_manual_code(self.id)
         try:
