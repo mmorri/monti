@@ -55,7 +55,9 @@ def to_responses_payload(request: ChatRequest) -> dict:
             items.append({"type": "message", "role": "user",
                           "content": [{"type": "input_text", "text": text or ""}]})
     payload: dict = {"model": request.model, "input": items, "stream": True,
-                     "store": False, "include": ["usage"]}
+                     "store": False}
+    # NOTE: no "include": ["usage"] — the Codex gateway rejects it (400);
+    # token accounting arrives on response.completed regardless.
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)
     if request.tools:

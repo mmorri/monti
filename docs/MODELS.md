@@ -64,15 +64,16 @@ Astra) and Codex CLI version (Astra needs ≥0.153.0):
 `gpt-5.5` retires from Codex sign-in on **2026-10-14** — replace with
 `gpt-6-sol`/`gpt-6-luna` per OpenAI's migration note.
 
-## windsurf (Cognition) — reference snapshot, VERIFY live ⚠️
+## windsurf (Cognition) — live catalog ✅ (2026-10-06, 280 UIDs)
 
-`opencode-windsurf-auth` documents 94 IDs, incl. `claude-opus-4.7`,
-`gpt-5.5`, `gemini-3.5-flash`, `kimi-k2.6`, `deepseek-v4`, `swe-1.6`
-(+`:variant` suffixes like `:high`, `:thinking`, `-fast`).
-No Fable 5.x / Opus 5.x / GPT-6 in that snapshot, and the per-account
-catalog is authoritative — **run `monti models` after login** and promote
-confirmed UIDs into the pools. Guessed form `claude-fable-5-1` is
-unconfirmed (real UIDs look like `claude-opus-4-7-medium`).
+`opencode-windsurf-auth` documents 94 IDs, but the live per-account catalog
+is authoritative — and it differs: plain `gpt-5.5` does NOT exist (use
+`gpt-5-5-medium` + `-low`/`-high`/`-max` effort suffixes), Fable UIDs are
+`claude-fable-5-1-medium` (etc.), Opus 4.7 is `claude-opus-4-7-medium`.
+Also live: `swe-1-7` (+`-lightning`), `kimi-k3-high`, `kimi-k2-7`,
+`deepseek-v4-pro-max`, `gemini-3-5-flash-medium`. Effort suffixes
+(`-low/-medium/-high/-max`, `-fast`, `-thinking`) are part of the UID —
+always copy the exact string from `monti models`.
 
 ## copilot (GitHub Copilot) — vendor docs, not in default pools
 
