@@ -76,8 +76,13 @@ def credentials_from_payload(payload: dict, refresh_fallback: str = "") -> Crede
 
 
 def _post_token(fields: dict) -> dict:
+    # Anthropic's edge (Cloudflare) 403s non-browser signatures — mirror the
+    # axios-shaped headers the working reference sends on OAuth calls.
     try:
-        return post_json(TOKEN_URL, fields, timeout=30.0).json()
+        return post_json(TOKEN_URL, fields, headers={
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "axios/1.15.2",
+        }, timeout=30.0).json()
     except HttpStatusError as exc:
         raise AuthFlowError(f"Anthropic token request failed (HTTP {exc.status})") from None
 
