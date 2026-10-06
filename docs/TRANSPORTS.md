@@ -7,7 +7,7 @@ provider.
 
 | Provider | Auth | Chat transport |
 |---|---|---|
-| `kimi` | Device authorization grant (opencodex port) | OpenAI-compatible `POST {api.kimi.com/coding/v1}/chat/completions`, SSE. |
+| `kimi` | Device authorization grant (opencodex port; global kimi.ai default, CN kimi.com via `domain`) | OpenAI-compatible `POST {api.kimi.ai/coding/v1}/chat/completions`, SSE. |
 | `anthropic` | PKCE browser (opencodex port) | Anthropic Messages API (`POST /v1/messages`, SSE) with the OAuth beta headers the opencodex adapter applies (`claude-code-20250219,oauth-2025-04-20`). |
 | `muse` | RFC 8628 device flow at `auth.meta.com` + subscription-key mint at `api.meta.ai/muse-code/key` (CLIProxyAPI port) | OpenAI-compatible `POST {base_url from mint}/chat/completions`, SSE. |
 | `zai` | Interactive GLM Coding Plan key via `monti login zai` only (plan-key exception, see SPEC.md; no portable OAuth exists) | OpenAI-compatible `POST {api.z.ai/api/coding/paas/v4}/chat/completions`, SSE. |

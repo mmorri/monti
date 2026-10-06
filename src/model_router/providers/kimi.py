@@ -1,14 +1,14 @@
 """Kimi (Kimi Code) subscription auth: device authorization grant.
 
-Port of opencodex src/oauth/kimi.ts (MIT, see THIRD_PARTY.md):
-host https://auth.kimi.com (config-overridable), public client
-17e5f671-d194-4dfb-9706-5516cb48c098, POST /api/oauth/device_authorization
-then POST /api/oauth/token with the device_code grant; refresh via the
-refresh_token grant. Kimi CLI headers (User-Agent KimiCLI/0.14.0, X-Msh-*)
-identify the client; device id persists in the config dir, mode 0600.
-
-Chat transport: OpenAI-compatible POST
-https://api.kimi.com/coding/v1/chat/completions.
+Port of opencodex src/oauth/kimi.ts (MIT, see THIRD_PARTY.md), cross-checked
+against CLIProxyAPI internal/auth/kimi/kimi.go for the two Kimi regions:
+global kimi.ai (auth.kimi.ai + api.kimi.ai/coding/v1, the default) and CN
+kimi.com (auth.kimi.com + api.kimi.com/coding/v1 via the domain option).
+Public client 17e5f671-d194-4dfb-9706-5516cb48c098, POST
+/api/oauth/device_authorization then POST /api/oauth/token with the
+device_code grant; refresh via the refresh_token grant. Kimi CLI headers
+(User-Agent KimiCLI/0.14.0, X-Msh-*) identify the client; device id
+persists in the config dir, mode 0600.
 """
 
 from __future__ import annotations
@@ -27,13 +27,23 @@ from .base import ChatRequest, ChatTransport, Provider
 from .openai_compat import OpenAICompatTransport, list_openai_models
 
 CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-DEFAULT_OAUTH_HOST = "https://auth.kimi.com"
 KIMI_CLI_VERSION = "0.14.0"
 DEVICE_ID_FILENAME = "kimi-device-id"
 DEFAULT_POLL_INTERVAL_S = 5.0
 DEFAULT_FLOW_TTL_S = 15 * 60.0
 EXPIRY_SKEW_MS = 5 * 60 * 1000
-GATEWAY_BASE_URL = "https://api.kimi.com/coding/v1"
+
+# Global first: kimi.ai is the international subscription; kimi.com serves CN.
+DOMAINS: dict[str, tuple[str, str]] = {
+    "kimi.ai": ("https://auth.kimi.ai", "https://api.kimi.ai/coding/v1"),
+    "kimi.com": ("https://auth.kimi.com", "https://api.kimi.com/coding/v1"),
+}
+DEFAULT_DOMAIN = "kimi.ai"
+
+
+def hosts_for(domain: str) -> tuple[str, str]:
+    """(oauth_host, gateway_base_url) for a Kimi domain."""
+    return DOMAINS.get(domain.strip().lower(), DOMAINS[DEFAULT_DOMAIN])
 
 
 def _device_id(config_dir: Path) -> str:
@@ -69,7 +79,8 @@ def common_headers(config_dir: Path) -> dict[str, str]:
     }
 
 
-def credentials_from_payload(payload: dict, refresh_fallback: str = "") -> Credentials:
+def credentials_from_payload(payload: dict, refresh_fallback: str = "",
+                             domain: str = "") -> Credentials:
     access = payload.get("access_token")
     refresh = payload.get("refresh_token") or refresh_fallback
     if not isinstance(access, str) or not access:
@@ -84,20 +95,45 @@ def credentials_from_payload(payload: dict, refresh_fallback: str = "") -> Crede
         or jwt_claim(access, "sub") or jwt_claim(refresh, "sub") or ""
     email = ((jwt_claim(access, "email") or jwt_claim(refresh, "email")) or "").lower()
     return Credentials(access=access, refresh=refresh, expires=expires,
-                       account_id=account_id, email=email)
+                       account_id=account_id, email=email,
+                       extra={"domain": domain} if domain else None)
 
 
 class KimiProvider(Provider):
     id = "kimi"
     display = "Kimi"
 
-    def __init__(self, progress=None, oauth_host: str = DEFAULT_OAUTH_HOST,
+    def __init__(self, progress=None, domain: str = DEFAULT_DOMAIN,
+                 oauth_host: str | None = None,
                  config_dir: Path | None = None,
-                 gateway_base_url: str = GATEWAY_BASE_URL):
+                 gateway_base_url: str | None = None):
         super().__init__(progress)
-        self.oauth_host = oauth_host.rstrip("/")
+        self.domain = domain if domain in DOMAINS else DEFAULT_DOMAIN
+        default_oauth, default_gateway = hosts_for(self.domain)
+        self.oauth_host = (oauth_host or default_oauth).rstrip("/")
         self.config_dir = config_dir or (Path.home() / ".config" / "model-router")
-        self.gateway_base_url = gateway_base_url
+        self.gateway_base_url = gateway_base_url or default_gateway
+
+    def _headers(self) -> dict[str, str]:
+        return common_headers(self.config_dir)
+
+    def _host_for(self, creds: Credentials) -> str:
+        """Refresh against the region the token was issued on, not the
+        current config default — an account on kimi.ai stays on kimi.ai."""
+        stored = (creds.extra or {}).get("domain")
+        if stored in DOMAINS and stored != self.domain and not self._overridden():
+            return hosts_for(stored)[0]
+        return self.oauth_host
+
+    def _overridden(self) -> bool:
+        default_oauth, _default_gateway = hosts_for(self.domain)
+        return self.oauth_host.rstrip("/") != default_oauth.rstrip("/")
+
+    def _gateway_for(self, creds: Credentials) -> str:
+        stored = (creds.extra or {}).get("domain")
+        if stored in DOMAINS and stored != self.domain and not self._overridden():
+            return hosts_for(stored)[1]
+        return self.gateway_base_url
 
     def _headers(self) -> dict[str, str]:
         return common_headers(self.config_dir)
@@ -139,15 +175,16 @@ class KimiProvider(Provider):
                 continue
             if payload.get("error"):
                 raise AuthFlowError("Kimi device authorization denied or expired")
-            return credentials_from_payload(payload)
+            return credentials_from_payload(payload, domain=self.domain)
         raise AuthFlowError("Kimi device authorization timed out")
 
     def refresh(self, creds: Credentials) -> Credentials:
         if not creds.refresh:
             raise ReloginRequired(self.id)
+        host = self._host_for(creds)
         try:
             payload = post_form(
-                f"{self.oauth_host}/api/oauth/token",
+                f"{host}/api/oauth/token",
                 {"grant_type": "refresh_token", "refresh_token": creds.refresh,
                  "client_id": CLIENT_ID},
                 headers=self._headers(), timeout=30.0).json()
@@ -156,14 +193,15 @@ class KimiProvider(Provider):
         if payload.get("error"):
             raise ReloginRequired(self.id)
         try:
-            return credentials_from_payload(payload, creds.refresh)
+            domain = (creds.extra or {}).get("domain") or self.domain
+            return credentials_from_payload(payload, creds.refresh, domain=domain)
         except AuthFlowError as exc:
             raise ReloginRequired(self.id) from exc
 
     def open_chat(self, creds: Credentials, request: ChatRequest, **kwargs) -> ChatTransport:
         return OpenAICompatTransport(
-            base_url=self.gateway_base_url, access_token=creds.access, request=request)
+            base_url=self._gateway_for(creds), access_token=creds.access, request=request)
 
     def list_models(self, creds: Credentials) -> list[str]:
-        return list_openai_models(self.gateway_base_url, creds.access,
+        return list_openai_models(self._gateway_for(creds), creds.access,
                                   extra_headers=self._headers())

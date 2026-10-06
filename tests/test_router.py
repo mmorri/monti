@@ -575,6 +575,35 @@ def test_strict_startup_refuses_unported_transport(tmp_path: Path):
         app.check_auth()
 
 
+def test_kimi_defaults_to_global_and_refresh_follows_stored_domain(monkeypatch):
+    from model_router.providers import kimi as kimi_provider
+
+    # Global default: kimi.ai, not the CN kimi.com.
+    provider = kimi_provider.KimiProvider()
+    assert provider.oauth_host == "https://auth.kimi.ai"
+    assert provider.gateway_base_url == "https://api.kimi.ai/coding/v1"
+    cn = kimi_provider.KimiProvider(domain="kimi.com")
+    assert cn.oauth_host == "https://auth.kimi.com"
+
+    # A token issued on kimi.com keeps refreshing there even when the
+    # provider default is the global domain.
+    seen = []
+
+    def fake_post_form(url, fields, headers=None, timeout=0.0):
+        from types import SimpleNamespace
+
+        seen.append(url)
+        return SimpleNamespace(json=lambda: {"access_token": "new", "refresh_token": "r",
+                                             "expires_in": 3600})
+
+    monkeypatch.setattr(kimi_provider, "post_form", fake_post_form)
+    creds = kimi_provider.Credentials(access="old", refresh="r",
+                                      extra={"domain": "kimi.com"})
+    refreshed = provider.refresh(creds)
+    assert seen == ["https://auth.kimi.com/api/oauth/token"]
+    assert refreshed.extra["domain"] == "kimi.com"
+
+
 def test_strict_startup_all_ready(tmp_path: Path):
     store = TokenStore(tmp_path / "store")
     store.save("kimi", Credentials(access="a", refresh="r", expires=0))

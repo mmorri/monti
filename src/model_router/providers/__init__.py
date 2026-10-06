@@ -31,5 +31,5 @@ def create(provider_id: str, **kwargs) -> Provider:
         factory = REGISTRY[provider_id]
     except KeyError:
         raise ValueError(f"unknown provider '{provider_id}' (known: {sorted(REGISTRY)})") from None
-    accepted = {"gateway_base_url", "oauth_host", "config_dir", "progress"}
+    accepted = {"gateway_base_url", "oauth_host", "config_dir", "progress", "domain"}
     return factory(**{k: v for k, v in kwargs.items() if k in accepted})

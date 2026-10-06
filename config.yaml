@@ -19,7 +19,7 @@ policy:
       - "still broken"
 # Optional per-provider overrides (host URLs only — never keys):
 # providers:
-#   kimi: { oauth_host: "https://auth.kimi.com" }
-#   xai:  { gateway_base_url: "https://cli-chat-proxy.grok.com/v1" }
+#   kimi:  { domain: "kimi.com" }   # CN subscription; kimi.ai is the default
+#   xai:   { gateway_base_url: "https://cli-chat-proxy.grok.com/v1" }
 port: 8787
 log_dir: "~/.config/model-router/logs"
